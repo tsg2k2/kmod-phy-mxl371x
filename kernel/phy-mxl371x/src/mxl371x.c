@@ -259,6 +259,7 @@
 struct mxl371x_priv {
 	struct phy_device *phydev;	/* back-pointer for the stats workqueue */
 	bool fw_loaded;
+	int backhaul_speed;		/* fixed SGMII/HSGMII rate (SPEED_*) */
 	u32 soc_chip_type;
 	u32 device_id;
 	u32 revision_id;
@@ -1628,6 +1629,7 @@ static int mxl371x_detect_sgmii_mode(struct phy_device *phydev, u8 *detected_mod
 
 static int mxl371x_config_sgmii(struct phy_device *phydev)
 {
+	struct mxl371x_priv *priv = phydev->priv;
 	struct device *dev = &phydev->mdio.dev;
 	int ret;
 	u8 mode;
@@ -1698,6 +1700,7 @@ static int mxl371x_config_sgmii(struct phy_device *phydev)
 	}
 
 	phydev->duplex = DUPLEX_FULL;
+	priv->backhaul_speed = phydev->speed;
 	dev_info(dev, "Configured %s @ %dMbps\n",
 		 mode == MXL371X_SGMII_MODE_HSGMII ? "HSGMII" :
 		 mode == MXL371X_SGMII_MODE_1000BASE_X ? "1000BASE-X" : "SGMII",
@@ -1816,6 +1819,18 @@ static int mxl371x_read_status(struct phy_device *phydev)
 	ret = genphy_read_status(phydev);
 	if (ret < 0)
 		return ret;
+
+	/*
+	 * The backhaul is a fixed-speed SGMII/HSGMII link with no copper
+	 * autoneg, but genphy_read_status() derives speed/duplex from the
+	 * standard registers (not implemented on this PHY) and clobbers the
+	 * configured values back to ~1G.  Re-assert the fixed backhaul rate so
+	 * phylink programs the switch SerDes correctly (e.g. 2.5G for HSGMII).
+	 */
+	if (priv->backhaul_speed) {
+		phydev->speed = priv->backhaul_speed;
+		phydev->duplex = DUPLEX_FULL;
+	}
 
 	/*
 	 * Report the MoCA link from the value cached by the stats workqueue --
