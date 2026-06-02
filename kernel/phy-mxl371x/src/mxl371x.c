@@ -161,6 +161,24 @@
 #define MXL_MOCA_LOF_OFF_LOF		0x04
 
 /*
+ * Per-link PHY-rate (FMR) report.  The coax PHY rate is per-peer, asymmetric
+ * and dynamic (~3.5 Gbps for MoCA 2.5) -- it is reported via sysfs / ethtool
+ * -S, NOT as the (fixed) Ethernet interface speed.  Payload = [node_bitmask,
+ * table_type]; table 2 carries the rates.  The response is BIG-ENDIAN within
+ * each word: [0]=status, [1]=active node mask, [0x08..0x28) node-list (node,
+ * flag byte pairs, 0xff-terminated), [0x28]+ a per-node block.  Each type-2
+ * link entry is cp(u8) pad(u8) nbits(be16) pad(be16); a per-node trailer of
+ * u8 + be16 + u8 defTableNum + defTableNum*8 bytes follows the 16 links.
+ * Rate(Mbps) = nbits*1200 / ((cp+138)*52).
+ */
+#define MXL_MOCA_CMD_GET_FMR_INFO	0x101001d
+#define MXL_MOCA_FMR_RSP_LEN		0x1a0	/* 416 bytes */
+#define MXL_MOCA_FMR_TYPE_DETAILED	2
+#define MXL_MOCA_FMR_NODELIST_OFF	0x08
+#define MXL_MOCA_FMR_DATA_OFF		0x28
+#define MXL_MOCA_MAX_NODES		16
+
+/*
  * Boot-config sequence: four parameter payloads followed by InitStart.  The
  * payloads are static (in mxl371x_payloads.h); only InitParamV2's GUID is
  * patched per device.  InitStart then admits the node to the network.
@@ -265,7 +283,9 @@ struct mxl371x_priv {
 	u32 revision_id;
 	u32 link_status;
 	u32 moca_version;
-	u32 phy_rate;
+	u32 phy_rate;			/* headline coax PHY rate (Mbps): TX to NC */
+	u16 phy_rate_tx[MXL_MOCA_MAX_NODES];	/* our node -> peer (Mbps) */
+	u16 phy_rate_rx[MXL_MOCA_MAX_NODES];	/* peer -> our node (Mbps) */
 	u32 node_id;
 	u32 nc_node_id;
 	u32 lof;
@@ -564,6 +584,94 @@ static int mxl371x_mbox_cmd(struct phy_device *phydev, u16 cmd_id,
 			    const u32 *payload, u32 payload_len,
 			    u32 *rsp, u32 rsp_max_words, u32 poll_retries);
 
+/* PHY rate (Mbps) for one type-2 FMR link entry. */
+static u16 mxl371x_fmr_rate(u8 cp, u16 nbits)
+{
+	u32 denom = ((u32)cp + 138) * 52;
+
+	if (!nbits || !denom)
+		return 0;
+	return min_t(u32, ((u32)nbits * 1200) / denom, U16_MAX);
+}
+
+/*
+ * Read the per-link MoCA coax PHY rates (GetFmrInfo, table type 2) and cache
+ * the TX (our node -> peer) and RX (peer -> our node) rate to each active
+ * node.  These are per-peer, asymmetric and dynamic, so they are surfaced via
+ * sysfs and ethtool -S, never as the fixed Ethernet interface speed.
+ */
+static void mxl371x_read_phy_rates(struct phy_device *phydev)
+{
+	struct mxl371x_priv *priv = phydev->priv;
+	u32 my = priv->node_id, active = priv->active_nodes;
+	u16 tx[MXL_MOCA_MAX_NODES] = {}, rx[MXL_MOCA_MAX_NODES] = {};
+	int n, peer;
+
+	/*
+	 * Query one node's FMR row per call (payload node mask = BIT(n)): a
+	 * full multi-node type-2 FMR overflows the 416-byte response, so we
+	 * page per node.  Node n's row holds the rates from n to every peer --
+	 * the n==us row is our TX, and entry [us] of every row is our RX.
+	 */
+	for (n = 0; n < MXL_MOCA_MAX_NODES; n++) {
+		u32 rsp[MXL_MOCA_FMR_RSP_LEN / 4];
+		u32 pl[2];
+		u8 *b = (u8 *)rsp;
+		int ret, nbytes, i, dp;
+
+		if (!(active & BIT(n)))
+			continue;
+		pl[0] = BIT(n);
+		pl[1] = MXL_MOCA_FMR_TYPE_DETAILED;
+		ret = mxl371x_mbox_cmd(phydev, MXL_MOCA_CMD_GET_FMR_INFO & 0xffff,
+				       pl, sizeof(pl), rsp, ARRAY_SIZE(rsp),
+				       MXL371X_MBOX_POLL_STATUS);
+		if (ret < MXL_MOCA_FMR_DATA_OFF + 6 || rsp[0] != 0)
+			continue;
+		nbytes = min_t(int, ret, MXL_MOCA_FMR_RSP_LEN);
+
+		/* FMR payload is big-endian within each word -- repack to an
+		 * MSB-first byte stream (in place; status already checked). */
+		for (i = 0; i * 4 < nbytes; i++) {
+			u32 w = rsp[i];
+
+			b[i * 4 + 0] = w >> 24;
+			b[i * 4 + 1] = w >> 16;
+			b[i * 4 + 2] = w >> 8;
+			b[i * 4 + 3] = w;
+		}
+
+		/* Single node block starts at DATA_OFF; 6 bytes per peer. */
+		dp = MXL_MOCA_FMR_DATA_OFF;
+		for (peer = 0; peer < MXL_MOCA_MAX_NODES; peer++, dp += 6) {
+			u16 nbits, rate;
+			u8 cp;
+
+			if (dp + 6 > nbytes)
+				break;
+			cp = b[dp];
+			nbits = (b[dp + 2] << 8) | b[dp + 3];
+			rate = mxl371x_fmr_rate(cp, nbits);
+			if (n == my)
+				tx[peer] = rate;
+			if (peer == my)
+				rx[n] = rate;
+		}
+	}
+
+	/*
+	 * Publish the freshly built matrix in one shot so a concurrent sysfs /
+	 * ethtool reader never sees a half-updated (zeroed) table.
+	 */
+	memcpy(priv->phy_rate_tx, tx, sizeof(tx));
+	memcpy(priv->phy_rate_rx, rx, sizeof(rx));
+
+	/* Headline = TX rate to the NC, else the first nonzero peer rate. */
+	priv->phy_rate = tx[priv->nc_node_id & 0xf];
+	for (peer = 0; !priv->phy_rate && peer < MXL_MOCA_MAX_NODES; peer++)
+		priv->phy_rate = tx[peer];
+}
+
 /*
  * Update MoCA link state over the mailbox.  An earlier approach read the
  * 0x0c1000xx link-state registers directly, but on running firmware those
@@ -596,7 +704,7 @@ static int mxl371x_read_moca_status(struct phy_device *phydev)
 	priv->moca_version = rsp[MXL_MOCA_LI_OFF_MOCAVER / 4];
 	priv->active_nodes = rsp[MXL_MOCA_LI_OFF_ACTIVEMASK / 4];
 
-	/* LOF is only meaningful once the link is up. */
+	/* LOF and per-link PHY rates are only meaningful once the link is up. */
 	if (priv->link_status == MOCA_LINK_UP) {
 		u32 lof[MXL_MOCA_LOF_RSP_LEN / 4];
 
@@ -605,6 +713,12 @@ static int mxl371x_read_moca_status(struct phy_device *phydev)
 				     MXL371X_MBOX_POLL_STATUS) >=
 		    MXL_MOCA_LOF_RSP_LEN)
 			priv->lof = lof[MXL_MOCA_LOF_OFF_LOF / 4];
+
+		mxl371x_read_phy_rates(phydev);
+	} else {
+		priv->phy_rate = 0;
+		memset(priv->phy_rate_tx, 0, sizeof(priv->phy_rate_tx));
+		memset(priv->phy_rate_rx, 0, sizeof(priv->phy_rate_rx));
 	}
 
 	return 0;
@@ -828,6 +942,24 @@ static ssize_t moca_phy_rate_show(struct device *dev,
 }
 static DEVICE_ATTR_RO(moca_phy_rate);
 
+/* Per-peer coax PHY-rate matrix (Mbps); TX = us->peer, RX = peer->us. */
+static ssize_t moca_phy_rates_show(struct device *dev,
+				   struct device_attribute *attr, char *buf)
+{
+	struct phy_device *phydev = to_phy_device(dev);
+	struct mxl371x_priv *priv = phydev->priv;
+	int n, len = 0;
+
+	for (n = 0; n < MXL_MOCA_MAX_NODES; n++) {
+		if (n == priv->node_id || !(priv->active_nodes & BIT(n)))
+			continue;
+		len += sprintf(buf + len, "node%d tx=%u rx=%u Mbps\n",
+			       n, priv->phy_rate_tx[n], priv->phy_rate_rx[n]);
+	}
+	return len;
+}
+static DEVICE_ATTR_RO(moca_phy_rates);
+
 static ssize_t moca_node_id_show(struct device *dev,
 				 struct device_attribute *attr, char *buf)
 {
@@ -1046,6 +1178,7 @@ static struct attribute *mxl371x_attrs[] = {
 	&dev_attr_moca_link_status.attr,
 	&dev_attr_moca_version.attr,
 	&dev_attr_moca_phy_rate.attr,
+	&dev_attr_moca_phy_rates.attr,
 	&dev_attr_moca_node_id.attr,
 	&dev_attr_moca_nc_node_id.attr,
 	&dev_attr_moca_lof.attr,
@@ -1892,6 +2025,38 @@ static int mxl371x_match_phy_device(struct phy_device *phydev,
 	return ((phydev->phy_id & MXL371X_OUI_MASK) == MXL371X_OUI);
 }
 
+/*
+ * Per-peer coax PHY rates as named ethtool -S statistics (Mbps gauges).  This
+ * is the standard-tools channel for the asymmetric, dynamic MoCA rates -- the
+ * interface speed stays the fixed backhaul rate.
+ */
+static int mxl371x_get_sset_count(struct phy_device *phydev)
+{
+	return 2 * MXL_MOCA_MAX_NODES;
+}
+
+static void mxl371x_get_strings(struct phy_device *phydev, u8 *data)
+{
+	int n;
+
+	for (n = 0; n < MXL_MOCA_MAX_NODES; n++)
+		ethtool_sprintf(&data, "moca_tx_phy_rate_node%d", n);
+	for (n = 0; n < MXL_MOCA_MAX_NODES; n++)
+		ethtool_sprintf(&data, "moca_rx_phy_rate_node%d", n);
+}
+
+static void mxl371x_get_stats(struct phy_device *phydev,
+			      struct ethtool_stats *stats, u64 *data)
+{
+	struct mxl371x_priv *priv = phydev->priv;
+	int n, i = 0;
+
+	for (n = 0; n < MXL_MOCA_MAX_NODES; n++)
+		data[i++] = priv->phy_rate_tx[n];
+	for (n = 0; n < MXL_MOCA_MAX_NODES; n++)
+		data[i++] = priv->phy_rate_rx[n];
+}
+
 static struct phy_driver mxl371x_drivers[] = {
 	{
 		PHY_ID_MATCH_EXACT(MXL3710_PHY_ID),
@@ -1903,6 +2068,9 @@ static struct phy_driver mxl371x_drivers[] = {
 		.config_aneg	= mxl371x_config_aneg,
 		.read_status	= mxl371x_read_status,
 		.get_phy_stats	= mxl371x_get_phy_stats,
+		.get_sset_count	= mxl371x_get_sset_count,
+		.get_strings	= mxl371x_get_strings,
+		.get_stats	= mxl371x_get_stats,
 		.suspend	= mxl371x_suspend,
 		.resume		= mxl371x_resume,
 		.read_page	= mxl371x_read_page,
@@ -1917,6 +2085,9 @@ static struct phy_driver mxl371x_drivers[] = {
 		.config_aneg	= mxl371x_config_aneg,
 		.read_status	= mxl371x_read_status,
 		.get_phy_stats	= mxl371x_get_phy_stats,
+		.get_sset_count	= mxl371x_get_sset_count,
+		.get_strings	= mxl371x_get_strings,
+		.get_stats	= mxl371x_get_stats,
 		.suspend	= mxl371x_suspend,
 		.resume		= mxl371x_resume,
 		.read_page	= mxl371x_read_page,
@@ -1931,6 +2102,9 @@ static struct phy_driver mxl371x_drivers[] = {
 		.config_aneg	= mxl371x_config_aneg,
 		.read_status	= mxl371x_read_status,
 		.get_phy_stats	= mxl371x_get_phy_stats,
+		.get_sset_count	= mxl371x_get_sset_count,
+		.get_strings	= mxl371x_get_strings,
+		.get_stats	= mxl371x_get_stats,
 		.suspend	= mxl371x_suspend,
 		.resume		= mxl371x_resume,
 		.read_page	= mxl371x_read_page,
