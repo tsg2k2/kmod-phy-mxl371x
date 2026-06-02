@@ -31,6 +31,13 @@ define Package/mxl-firmware/install
 	$(INSTALL_DIR) $(1)/lib/firmware
 	$(INSTALL_DATA) \
 		./ccpu.elf.leucadia \
+		./clink.bin \
+		./mcast.bin \
+		./rlapm.bin \
+		./endet.bin \
+		./sapm.bin \
+		./rssi.bin \
+		./platform.bin \
 		$(1)/lib/firmware/
 endef
 

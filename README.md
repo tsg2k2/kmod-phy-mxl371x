@@ -73,7 +73,7 @@ Required firmware must be placed in `/lib/firmware/`:
 To build `kmod-phy-mxl371x` for OpenWrt, first add this feed to your ``feeds.conf`` in a fully set-up OpenWrt SDK [(read here on how to setup the OpenWrt SDK)](https://openwrt.org/docs/guide-developer/using_the_sdk):
 
 ```
-echo "src-git mxl https://github.com/hurrian/kmod-phy-mxl371x.git" >> feeds.conf
+echo "src-git mxl https://github.com/tsg2k2/kmod-phy-mxl371x.git" >> feeds.conf
 
 $ ./scripts/feeds update -a
 $ ./scripts/feeds install -a
