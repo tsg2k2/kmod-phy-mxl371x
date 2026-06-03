@@ -217,6 +217,11 @@
 /* Enhanced-privacy password: a single 0x40-byte, zero-padded field. */
 #define MXL_CLINK_OFF_ENHPWD		0x285
 #define MXL_CLINK_ENHPWD_LEN		0x40
+/* Enhanced-privacy mode (0-7) and the network name (up to 0x20 ASCII bytes). */
+#define MXL_CLINK_OFF_ENHPRIVMODE	0x284
+#define MXL_CLINK_ENHPRIVMODE_MAX	7
+#define MXL_CLINK_OFF_NETNAME		0x2d4
+#define MXL_CLINK_NETNAME_LEN		0x20
 
 /* Apply staged config by re-initialising the SoC (defined after load_firmware). */
 static int mxl371x_reinit(struct phy_device *phydev);
@@ -1391,6 +1396,73 @@ static ssize_t moca_cfg_enhanced_password_store(struct device *dev,
 }
 static DEVICE_ATTR_WO(moca_cfg_enhanced_password);
 
+/* Enhanced-privacy mode: clink[0x284] (0-7). */
+static ssize_t moca_cfg_enhanced_privacy_mode_show(struct device *dev,
+		struct device_attribute *attr, char *buf)
+{
+	int v = moca_cfg_get_u8(to_phy_device(dev), MXL_CLINK_OFF_ENHPRIVMODE);
+
+	return v < 0 ? v : sprintf(buf, "%u\n", v);
+}
+static ssize_t moca_cfg_enhanced_privacy_mode_store(struct device *dev,
+		struct device_attribute *attr, const char *buf, size_t count)
+{
+	u8 val;
+	int ret;
+
+	if (kstrtou8(buf, 0, &val) || val > MXL_CLINK_ENHPRIVMODE_MAX)
+		return -EINVAL;
+	ret = moca_cfg_set_u8(to_phy_device(dev), MXL_CLINK_OFF_ENHPRIVMODE,
+			      0xff, val);
+	return ret ? ret : count;
+}
+static DEVICE_ATTR_RW(moca_cfg_enhanced_privacy_mode);
+
+/* Network name: up to 0x20 printable ASCII bytes at clink[0x2d4]. */
+static ssize_t moca_cfg_network_name_show(struct device *dev,
+		struct device_attribute *attr, char *buf)
+{
+	struct mxl371x_priv *priv = to_phy_device(dev)->priv;
+	char name[MXL_CLINK_NETNAME_LEN + 1];
+
+	mutex_lock(&priv->cfg_lock);
+	if (!priv->cfg_ready) {
+		mutex_unlock(&priv->cfg_lock);
+		return -ENODEV;
+	}
+	memcpy(name, priv->clink_cfg + MXL_CLINK_OFF_NETNAME,
+	       MXL_CLINK_NETNAME_LEN);
+	mutex_unlock(&priv->cfg_lock);
+	name[MXL_CLINK_NETNAME_LEN] = '\0';
+	return sprintf(buf, "%s\n", name);
+}
+static ssize_t moca_cfg_network_name_store(struct device *dev,
+		struct device_attribute *attr, const char *buf, size_t count)
+{
+	struct mxl371x_priv *priv = to_phy_device(dev)->priv;
+	size_t len = count;
+	int i;
+
+	if (len && buf[len - 1] == '\n')	/* tolerate a trailing newline */
+		len--;
+	if (len > MXL_CLINK_NETNAME_LEN)
+		return -EINVAL;
+	for (i = 0; i < len; i++)
+		if (buf[i] < 0x20 || buf[i] > 0x7e)	/* printable ASCII only */
+			return -EINVAL;
+
+	mutex_lock(&priv->cfg_lock);
+	if (!priv->cfg_ready) {
+		mutex_unlock(&priv->cfg_lock);
+		return -ENODEV;
+	}
+	memset(priv->clink_cfg + MXL_CLINK_OFF_NETNAME, 0, MXL_CLINK_NETNAME_LEN);
+	memcpy(priv->clink_cfg + MXL_CLINK_OFF_NETNAME, buf, len);
+	mutex_unlock(&priv->cfg_lock);
+	return count;
+}
+static DEVICE_ATTR_RW(moca_cfg_network_name);
+
 /*
  * Apply all staged moca_cfg_* changes.  Writing here re-initialises the MoCA
  * SoC with the edited config (the "save" step); the coax link drops for a few
@@ -1429,6 +1501,8 @@ static struct attribute *mxl371x_attrs[] = {
 	&dev_attr_moca_cfg_freq_band_mask.attr,
 	&dev_attr_moca_cfg_password.attr,
 	&dev_attr_moca_cfg_enhanced_password.attr,
+	&dev_attr_moca_cfg_enhanced_privacy_mode.attr,
+	&dev_attr_moca_cfg_network_name.attr,
 	&dev_attr_moca_cfg_apply.attr,
 	NULL,
 };
