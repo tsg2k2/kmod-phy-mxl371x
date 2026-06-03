@@ -22,7 +22,7 @@
 #include <linux/mutex.h>
 #include <linux/minmax.h>
 
-#include "mxl371x_payloads.h"
+#include "mxl371x_packer.h"
 
 /* MaxLinear OUI and PHY IDs */
 #define MXL371X_OUI			0x0243E000
@@ -180,8 +180,9 @@
 
 /*
  * Boot-config sequence: four parameter payloads followed by InitStart.  The
- * payloads are static (in mxl371x_payloads.h); only InitParamV2's GUID is
- * patched per device.  InitStart then admits the node to the network.
+ * payloads are packed at runtime (mxl371x_packer) from the per-board config
+ * blobs; InitParamV2 carries the per-device GUID.  InitStart then admits the
+ * node to the network.
  */
 #define MXL_MOCA_CMD_INIT_PARAM_V2	0x1010004
 #define MXL_MOCA_CMD_RLAPM_V2		0x1010005
@@ -191,10 +192,37 @@
 #define MXL_MOCA_INIT_START_RSP_LEN	0x10
 
 /*
- * MDIO indirect SoC-memory access window (Clause-22 registers).  An earlier
- * 0x0e/0x0f scheme was wrong on this part (those registers are read-only
- * constants, so reads returned garbage and writes were dropped).  The correct
- * window is:
+ * Editable clink.bin byte offsets (a subset of the config that is safe to
+ * change at runtime).  A moca_cfg_* sysfs write patches the in-RAM clink copy
+ * here, then the boot config is repacked and re-sent to re-admit the node.
+ */
+#define MXL_CLINK_OFF_NCSEARCH		0x024	/* bit5 = preferred NC, bits3-4 = net search */
+#define MXL_CLINK_NC_BIT		BIT(5)
+#define MXL_CLINK_NETSEARCH_MASK	(BIT(3) | BIT(4))
+#define MXL_CLINK_NETSEARCH_SHIFT	3
+#define MXL_CLINK_OFF_SECMODE		0x027	/* u8: 0x00 off / 0xff on */
+#define MXL_CLINK_OFF_LOF		0x0c8	/* u16 LE: last operating freq (MHz) */
+#define MXL_CLINK_OFF_FREQBAND		0x0cb	/* u8: frequency band bitmask */
+#define MXL_CLINK_OFF_BEACONPWR		0x22c	/* u8: beacon TX power */
+#define MXL_CLINK_OFF_MAXPWR		0x22d	/* u8: max TX power */
+/*
+ * MoCA privacy password: 8 per-band slots at clink[0x28], stride 0x12, up to
+ * 17 ASCII digits each, written identically to every band.  Only meaningful
+ * when security_mode is enabled, and every node must match.
+ */
+#define MXL_CLINK_OFF_PASSWORD		0x028
+#define MXL_CLINK_PWD_STRIDE		0x12
+#define MXL_CLINK_PWD_BANDS		8
+#define MXL_CLINK_PWD_MAXLEN		17
+/* Enhanced-privacy password: a single 0x40-byte, zero-padded field. */
+#define MXL_CLINK_OFF_ENHPWD		0x285
+#define MXL_CLINK_ENHPWD_LEN		0x40
+
+/* Apply staged config by re-initialising the SoC (defined after load_firmware). */
+static int mxl371x_reinit(struct phy_device *phydev);
+
+/*
+ * MDIO indirect SoC-memory access window (Clause-22 registers):
  *   0x1b cmd/status, 0x1c/0x1d address hi/lo, 0x1e/0x1f data hi/lo.
  * Every access is: wait-ready -> set address -> issue command -> wait-ready.
  */
@@ -305,10 +333,18 @@ struct mxl371x_priv {
 	u32 mbox_rsp_start_addr;
 	u32 mbox_cmd_byte_max;
 
-	/* debug: live mailbox command probe (write cmd-id -> read raw rsp hex) */
-	u16 dbg_cmd;
-	int dbg_rsp_len;	/* bytes returned by last probe, or -errno */
-	u32 dbg_rsp[384 / 4];
+	/*
+	 * Boot config retained for live reconfiguration: private copies of the
+	 * config blobs (clink is editable in place via the moca_cfg_* sysfs
+	 * attrs) plus the once-derived GUID.  A write repacks and re-admits.
+	 */
+	struct mxl371x_cfg_blobs cfg_blobs;	/* .data = priv-owned copies */
+	u8 *clink_cfg;				/* writable handle to cfg_blobs.clink */
+	u32 cfg_guid_hi, cfg_guid_lo;
+	bool cfg_ready;				/* blobs retained, reconfig possible */
+	struct mutex cfg_lock;			/* protects clink_cfg / cfg_guid (brief) */
+	struct mutex apply_lock;		/* serializes the long SoC re-init/apply */
+
 
 	/* Statistics */
 	struct {
@@ -993,21 +1029,21 @@ static DEVICE_ATTR_RO(moca_lof);
 static ssize_t moca_network_state_show(struct device *dev,
 				       struct device_attribute *attr, char *buf)
 {
-	struct phy_device *phydev = to_phy_device(dev);
-	struct mxl371x_priv *priv = phydev->priv;
+	struct mxl371x_priv *priv = to_phy_device(dev)->priv;
 	const char *state;
 
-	switch (priv->network_state) {
-	case MOCA_NET_STATE_NETWORK_MODE:
+	/*
+	 * The raw firmware netState enum is not fully mapped (it reads a
+	 * non-obvious value in steady state), but link status is authoritative:
+	 * a node with the coax link up is operating in the network.  Fall back
+	 * to the firmware state only to distinguish searching from idle.
+	 */
+	if (priv->link_status == MOCA_LINK_UP)
 		state = "network";
-		break;
-	case MOCA_NET_STATE_SEARCHING:
+	else if (priv->network_state == MOCA_NET_STATE_SEARCHING)
 		state = "searching";
-		break;
-	default:
+	else
 		state = "idle";
-		break;
-	}
 
 	return sprintf(buf, "%s\n", state);
 }
@@ -1061,24 +1097,29 @@ static ssize_t moca_fw_version_show(struct device *dev,
 static DEVICE_ATTR_RO(moca_fw_version);
 
 /* MoCA GUID - read/write */
+/*
+ * The MoCA GUID is the eMacAddrHi/Lo word pair derived at config time and
+ * injected into InitParamV2 (not a separately writable SoC register).  Show
+ * the configured value; a write stages a new GUID for the next SoC init.
+ */
 static ssize_t moca_guid_show(struct device *dev,
 			      struct device_attribute *attr, char *buf)
 {
-	struct phy_device *phydev = to_phy_device(dev);
-	u32 mac_hi, mac_lo;
+	struct mxl371x_priv *priv = to_phy_device(dev)->priv;
 	u8 mac[ETH_ALEN];
 
-	if (mxl371x_read_mem32(phydev, MOCA_MAC_ADDR_HI, &mac_hi) < 0)
-		return -EIO;
-	if (mxl371x_read_mem32(phydev, MOCA_MAC_ADDR_LO, &mac_lo) < 0)
-		return -EIO;
-
-	mac[0] = (mac_hi >> 24) & 0xff;
-	mac[1] = (mac_hi >> 16) & 0xff;
-	mac[2] = (mac_hi >> 8) & 0xff;
-	mac[3] = (mac_hi >> 0) & 0xff;
-	mac[4] = (mac_lo >> 24) & 0xff;
-	mac[5] = (mac_lo >> 16) & 0xff;
+	mutex_lock(&priv->cfg_lock);
+	if (!priv->cfg_ready) {
+		mutex_unlock(&priv->cfg_lock);
+		return -ENODEV;
+	}
+	mac[0] = priv->cfg_guid_hi >> 24;
+	mac[1] = priv->cfg_guid_hi >> 16;
+	mac[2] = priv->cfg_guid_hi >> 8;
+	mac[3] = priv->cfg_guid_hi;
+	mac[4] = priv->cfg_guid_lo >> 24;
+	mac[5] = priv->cfg_guid_lo >> 16;
+	mutex_unlock(&priv->cfg_lock);
 
 	return sprintf(buf, "%pM\n", mac);
 }
@@ -1087,92 +1128,282 @@ static ssize_t moca_guid_store(struct device *dev,
 			       struct device_attribute *attr,
 			       const char *buf, size_t count)
 {
-	struct phy_device *phydev = to_phy_device(dev);
+	struct mxl371x_priv *priv = to_phy_device(dev)->priv;
 	u8 mac[ETH_ALEN];
-	u32 mac_hi, mac_lo;
 
 	if (!mac_pton(buf, mac))
 		return -EINVAL;
-
-	/* Allow any non-zero MAC for MoCA GUID */
 	if (is_zero_ether_addr(mac))
 		return -EADDRNOTAVAIL;
 
-	mac_hi = (mac[0] << 24) | (mac[1] << 16) | (mac[2] << 8) | mac[3];
-	mac_lo = (mac[4] << 24) | (mac[5] << 16);
+	mutex_lock(&priv->cfg_lock);
+	if (!priv->cfg_ready) {
+		mutex_unlock(&priv->cfg_lock);
+		return -ENODEV;
+	}
+	priv->cfg_guid_hi = (mac[0] << 24) | (mac[1] << 16) |
+			    (mac[2] << 8) | mac[3];
+	priv->cfg_guid_lo = (mac[4] << 24) | (mac[5] << 16);
+	mutex_unlock(&priv->cfg_lock);
 
-	if (mxl371x_write_mem32(phydev, MOCA_MAC_ADDR_HI, mac_hi) < 0)
-		return -EIO;
-	if (mxl371x_write_mem32(phydev, MOCA_MAC_ADDR_LO, mac_lo) < 0)
-		return -EIO;
-
-	dev_info(dev, "MoCA GUID set to %pM\n", mac);
+	dev_info(dev, "MoCA GUID staged as %pM (applies on next SoC init)\n", mac);
 	return count;
 }
 static DEVICE_ATTR_RW(moca_guid);
 
 /*
- * Debug: issue an arbitrary mailbox command and capture the raw response so we
- * can probe firmware status/network queries live without reflashing.
- *   echo 0x15            > moca_dbg_cmd   # GET_LOCAL_INFO, zero payload
- *   echo "0x16 00 00 00 00" > moca_dbg_cmd   # cmd 0x16 with 4 payload bytes
- *   cat moca_dbg_cmd     # raw response words (byte offset + native LE word)
- * First hex token is the wire cmd-id; any further hex tokens are payload bytes
- * (padded up to a 4-byte boundary).
+ * Editable boot config (moca_cfg_*).  A write patches the in-RAM clink copy at
+ * the parameter's offset; reads decode the current (possibly edited) copy.
+ *
+ * Changes are STAGED, not applied live: a running MoCA SoC rejects the
+ * boot-config commands (UNKNOWN_CMD), so a setting only takes effect the next
+ * time the SoC is (re-)initialised and the config is repacked from this copy.
+ * These bytes are volatile (reset to the blob defaults on the next cold boot);
+ * persistence and apply orchestration are a userspace concern (e.g. UCI writing
+ * them at boot before the SoC init).
  */
-static ssize_t moca_dbg_cmd_store(struct device *dev,
-				  struct device_attribute *attr,
-				  const char *buf, size_t count)
+
+/* patch one byte (under mask) of the staged clink copy */
+static int moca_cfg_set_u8(struct phy_device *phydev, u32 off, u8 mask, u8 val)
 {
-	struct phy_device *phydev = to_phy_device(dev);
 	struct mxl371x_priv *priv = phydev->priv;
-	u32 payload[64] = {};
-	u8 *pb = (u8 *)payload;
-	unsigned int cmd, val, n = 0, plen;
-	const char *p = buf;
-	int consumed, ret;
 
-	if (!priv->mbox_ready)
+	mutex_lock(&priv->cfg_lock);
+	if (!priv->cfg_ready) {
+		mutex_unlock(&priv->cfg_lock);
 		return -ENODEV;
-	if (sscanf(p, "%x%n", &cmd, &consumed) < 1)
-		return -EINVAL;
-	p += consumed;
-	while (n < sizeof(payload) && sscanf(p, "%x%n", &val, &consumed) == 1) {
-		pb[n++] = val & 0xff;
-		p += consumed;
 	}
-	plen = round_up(n, 4);
+	priv->clink_cfg[off] = (priv->clink_cfg[off] & ~mask) | (val & mask);
+	mutex_unlock(&priv->cfg_lock);
+	return 0;
+}
 
-	priv->dbg_cmd = cmd & 0xffff;
-	ret = mxl371x_mbox_cmd(phydev, priv->dbg_cmd, n ? payload : NULL, plen,
-			       priv->dbg_rsp, ARRAY_SIZE(priv->dbg_rsp),
-			       MXL371X_MBOX_POLL_STATUS);
-	priv->dbg_rsp_len = ret;
-	dev_info(&phydev->mdio.dev,
-		 "dbg mbox cmd 0x%04x (%u payload bytes) -> %d\n",
-		 priv->dbg_cmd, plen, ret);
+/* read one byte of the clink copy, or -ENODEV if no config is loaded */
+static int moca_cfg_get_u8(struct phy_device *phydev, u32 off)
+{
+	struct mxl371x_priv *priv = phydev->priv;
+	int v;
+
+	mutex_lock(&priv->cfg_lock);
+	v = priv->cfg_ready ? priv->clink_cfg[off] : -ENODEV;
+	mutex_unlock(&priv->cfg_lock);
+	return v;
+}
+
+/* plain full-byte RW parameter */
+#define MOCA_CFG_U8_ATTR(_name, _off)					      \
+static ssize_t moca_cfg_##_name##_show(struct device *dev,		      \
+		struct device_attribute *attr, char *buf)		      \
+{									      \
+	int v = moca_cfg_get_u8(to_phy_device(dev), (_off));		      \
+									      \
+	return v < 0 ? v : sprintf(buf, "%u\n", v);			      \
+}									      \
+static ssize_t moca_cfg_##_name##_store(struct device *dev,		      \
+		struct device_attribute *attr, const char *buf, size_t count) \
+{									      \
+	u8 val;								      \
+	int ret;							      \
+									      \
+	if (kstrtou8(buf, 0, &val))					      \
+		return -EINVAL;						      \
+	ret = moca_cfg_set_u8(to_phy_device(dev), (_off), 0xff, val);	      \
+	return ret ? ret : count;					      \
+}									      \
+static DEVICE_ATTR_RW(moca_cfg_##_name)
+
+MOCA_CFG_U8_ATTR(beacon_tx_power, MXL_CLINK_OFF_BEACONPWR);
+MOCA_CFG_U8_ATTR(max_tx_power, MXL_CLINK_OFF_MAXPWR);
+MOCA_CFG_U8_ATTR(freq_band_mask, MXL_CLINK_OFF_FREQBAND);
+
+/* preferred NC: clink[0x24] bit5 (0/1) */
+static ssize_t moca_cfg_preferred_nc_show(struct device *dev,
+		struct device_attribute *attr, char *buf)
+{
+	int v = moca_cfg_get_u8(to_phy_device(dev), MXL_CLINK_OFF_NCSEARCH);
+
+	return v < 0 ? v : sprintf(buf, "%u\n", !!(v & MXL_CLINK_NC_BIT));
+}
+static ssize_t moca_cfg_preferred_nc_store(struct device *dev,
+		struct device_attribute *attr, const char *buf, size_t count)
+{
+	u8 val;
+	int ret;
+
+	if (kstrtou8(buf, 0, &val) || val > 1)
+		return -EINVAL;
+	ret = moca_cfg_set_u8(to_phy_device(dev), MXL_CLINK_OFF_NCSEARCH,
+			      MXL_CLINK_NC_BIT, val ? MXL_CLINK_NC_BIT : 0);
+	return ret ? ret : count;
+}
+static DEVICE_ATTR_RW(moca_cfg_preferred_nc);
+
+/* network search: clink[0x24] bits3-4 (0=off,1,2) */
+static ssize_t moca_cfg_network_search_show(struct device *dev,
+		struct device_attribute *attr, char *buf)
+{
+	int v = moca_cfg_get_u8(to_phy_device(dev), MXL_CLINK_OFF_NCSEARCH);
+
+	return v < 0 ? v : sprintf(buf, "%u\n",
+		(unsigned int)(v & MXL_CLINK_NETSEARCH_MASK) >>
+		MXL_CLINK_NETSEARCH_SHIFT);
+}
+static ssize_t moca_cfg_network_search_store(struct device *dev,
+		struct device_attribute *attr, const char *buf, size_t count)
+{
+	u8 val;
+	int ret;
+
+	if (kstrtou8(buf, 0, &val) || val > 2)
+		return -EINVAL;
+	ret = moca_cfg_set_u8(to_phy_device(dev), MXL_CLINK_OFF_NCSEARCH,
+			      MXL_CLINK_NETSEARCH_MASK,
+			      val << MXL_CLINK_NETSEARCH_SHIFT);
+	return ret ? ret : count;
+}
+static DEVICE_ATTR_RW(moca_cfg_network_search);
+
+/* security mode: clink[0x27] (0=off, 1=on -> 0x00/0xff) */
+static ssize_t moca_cfg_security_mode_show(struct device *dev,
+		struct device_attribute *attr, char *buf)
+{
+	int v = moca_cfg_get_u8(to_phy_device(dev), MXL_CLINK_OFF_SECMODE);
+
+	return v < 0 ? v : sprintf(buf, "%u\n", !!v);
+}
+static ssize_t moca_cfg_security_mode_store(struct device *dev,
+		struct device_attribute *attr, const char *buf, size_t count)
+{
+	u8 val;
+	int ret;
+
+	if (kstrtou8(buf, 0, &val) || val > 1)
+		return -EINVAL;
+	ret = moca_cfg_set_u8(to_phy_device(dev), MXL_CLINK_OFF_SECMODE,
+			      0xff, val ? 0xff : 0x00);
+	return ret ? ret : count;
+}
+static DEVICE_ATTR_RW(moca_cfg_security_mode);
+
+/* last operating frequency: clink[0xc8] u16 LE (MHz) */
+static ssize_t moca_cfg_lof_show(struct device *dev,
+		struct device_attribute *attr, char *buf)
+{
+	struct mxl371x_priv *priv = to_phy_device(dev)->priv;
+	int lo, hi;
+
+	mutex_lock(&priv->cfg_lock);
+	if (!priv->cfg_ready) {
+		mutex_unlock(&priv->cfg_lock);
+		return -ENODEV;
+	}
+	lo = priv->clink_cfg[MXL_CLINK_OFF_LOF];
+	hi = priv->clink_cfg[MXL_CLINK_OFF_LOF + 1];
+	mutex_unlock(&priv->cfg_lock);
+	return sprintf(buf, "%u\n", lo | (hi << 8));
+}
+static ssize_t moca_cfg_lof_store(struct device *dev,
+		struct device_attribute *attr, const char *buf, size_t count)
+{
+	struct mxl371x_priv *priv = to_phy_device(dev)->priv;
+	u16 val;
+
+	if (kstrtou16(buf, 0, &val))
+		return -EINVAL;
+	mutex_lock(&priv->cfg_lock);
+	if (!priv->cfg_ready) {
+		mutex_unlock(&priv->cfg_lock);
+		return -ENODEV;
+	}
+	priv->clink_cfg[MXL_CLINK_OFF_LOF] = val & 0xff;
+	priv->clink_cfg[MXL_CLINK_OFF_LOF + 1] = val >> 8;
+	mutex_unlock(&priv->cfg_lock);
 	return count;
 }
+static DEVICE_ATTR_RW(moca_cfg_lof);
 
-static ssize_t moca_dbg_cmd_show(struct device *dev,
-				 struct device_attribute *attr, char *buf)
+/*
+ * MoCA privacy password (write-only: a secret must not be read back).  Accepts
+ * up to 17 decimal digits and stages it into every per-band slot (the
+ * "mocapassword" setting).  Takes effect on the next SoC init (staged).
+ */
+static ssize_t moca_cfg_password_store(struct device *dev,
+		struct device_attribute *attr, const char *buf, size_t count)
 {
-	struct phy_device *phydev = to_phy_device(dev);
-	struct mxl371x_priv *priv = phydev->priv;
-	int len = priv->dbg_rsp_len;
-	int n, i;
+	struct mxl371x_priv *priv = to_phy_device(dev)->priv;
+	size_t len = count;
+	int i;
 
-	if (len < 0)
-		return sprintf(buf, "cmd=0x%04x error=%d\n", priv->dbg_cmd, len);
+	if (len && buf[len - 1] == '\n')	/* tolerate a trailing newline */
+		len--;
+	if (len == 0 || len > MXL_CLINK_PWD_MAXLEN)
+		return -EINVAL;
+	for (i = 0; i < len; i++)
+		if (buf[i] < '0' || buf[i] > '9')
+			return -EINVAL;
 
-	if (len > (int)sizeof(priv->dbg_rsp))
-		len = sizeof(priv->dbg_rsp);
-	n = sprintf(buf, "cmd=0x%04x rsp_bytes=%d\n", priv->dbg_cmd, len);
-	for (i = 0; i * 4 < len; i++)
-		n += sprintf(buf + n, "[0x%02x] %08x\n", i * 4, priv->dbg_rsp[i]);
-	return n;
+	mutex_lock(&priv->cfg_lock);
+	if (!priv->cfg_ready) {
+		mutex_unlock(&priv->cfg_lock);
+		return -ENODEV;
+	}
+	for (i = 0; i < MXL_CLINK_PWD_BANDS; i++) {
+		u8 *slot = priv->clink_cfg + MXL_CLINK_OFF_PASSWORD +
+			   i * MXL_CLINK_PWD_STRIDE;
+
+		memset(slot, 0, MXL_CLINK_PWD_STRIDE);
+		memcpy(slot, buf, len);
+	}
+	mutex_unlock(&priv->cfg_lock);
+	return count;
 }
-static DEVICE_ATTR_RW(moca_dbg_cmd);
+static DEVICE_ATTR_WO(moca_cfg_password);
+
+/*
+ * MoCA enhanced-privacy password (write-only).  Up to 64 decimal digits staged
+ * into the single clink field at 0x285, zero-padded (the "enhancedpassword"
+ * setting).  Takes effect on the next SoC init (staged).
+ */
+static ssize_t moca_cfg_enhanced_password_store(struct device *dev,
+		struct device_attribute *attr, const char *buf, size_t count)
+{
+	struct mxl371x_priv *priv = to_phy_device(dev)->priv;
+	size_t len = count;
+	int i;
+
+	if (len && buf[len - 1] == '\n')
+		len--;
+	if (len == 0 || len > MXL_CLINK_ENHPWD_LEN)
+		return -EINVAL;
+	for (i = 0; i < len; i++)
+		if (buf[i] < '0' || buf[i] > '9')
+			return -EINVAL;
+
+	mutex_lock(&priv->cfg_lock);
+	if (!priv->cfg_ready) {
+		mutex_unlock(&priv->cfg_lock);
+		return -ENODEV;
+	}
+	memset(priv->clink_cfg + MXL_CLINK_OFF_ENHPWD, 0, MXL_CLINK_ENHPWD_LEN);
+	memcpy(priv->clink_cfg + MXL_CLINK_OFF_ENHPWD, buf, len);
+	mutex_unlock(&priv->cfg_lock);
+	return count;
+}
+static DEVICE_ATTR_WO(moca_cfg_enhanced_password);
+
+/*
+ * Apply all staged moca_cfg_* changes.  Writing here re-initialises the MoCA
+ * SoC with the edited config (the "save" step); the coax link drops for a few
+ * seconds while the firmware reloads and the node re-admits.
+ */
+static ssize_t moca_cfg_apply_store(struct device *dev,
+		struct device_attribute *attr, const char *buf, size_t count)
+{
+	int ret = mxl371x_reinit(to_phy_device(dev));
+
+	return ret ? ret : count;
+}
+static DEVICE_ATTR_WO(moca_cfg_apply);
 
 static struct attribute *mxl371x_attrs[] = {
 	&dev_attr_moca_link_status.attr,
@@ -1188,7 +1419,17 @@ static struct attribute *mxl371x_attrs[] = {
 	&dev_attr_moca_chip_type.attr,
 	&dev_attr_moca_fw_version.attr,
 	&dev_attr_moca_guid.attr,
-	&dev_attr_moca_dbg_cmd.attr,
+	/* editable boot config (re-admits on write) */
+	&dev_attr_moca_cfg_lof.attr,
+	&dev_attr_moca_cfg_preferred_nc.attr,
+	&dev_attr_moca_cfg_network_search.attr,
+	&dev_attr_moca_cfg_security_mode.attr,
+	&dev_attr_moca_cfg_beacon_tx_power.attr,
+	&dev_attr_moca_cfg_max_tx_power.attr,
+	&dev_attr_moca_cfg_freq_band_mask.attr,
+	&dev_attr_moca_cfg_password.attr,
+	&dev_attr_moca_cfg_enhanced_password.attr,
+	&dev_attr_moca_cfg_apply.attr,
 	NULL,
 };
 
@@ -1431,50 +1672,75 @@ static void mxl371x_query_fw_version(struct phy_device *phydev)
 }
 
 /*
- * Push the MoCA boot configuration and admit the node to the network: send the
- * four parameter payloads, then InitStart.  The payloads are the static
- * byte-exact arrays in mxl371x_payloads.h; only InitParamV2 carries the
- * per-device GUID, patched into a mutable copy.  Sent over the mailbox.
+ * Push the MoCA boot configuration and admit the node to the network: load the
+ * per-board config blobs, pack the four parameter payloads from them, send
+ * those, then InitStart.  InitParamV2 carries the per-device GUID.  All over
+ * the mailbox.
  */
-static int mxl371x_send_config(struct phy_device *phydev)
+/*
+ * Config blob file names, in mxl371x_cfg_blobs order.  They are loaded by plain
+ * name from the firmware search path (/lib/firmware), the same location as the
+ * SoC ELF.  The board-specific blob set is selected at build time (the device's
+ * firmware package installs its blobs there), so the driver carries no
+ * board-variant knowledge.
+ */
+static const char * const mxl371x_blob_names[] = {
+	"clink.bin", "mcast.bin", "rlapm.bin", "endet.bin",
+	"sapm.bin", "rssi.bin", "platform.bin",
+};
+
+/*
+ * Pack the four boot-config payloads from the retained blobs (clink reflects
+ * any moca_cfg_* edits) and send them, then InitStart to (re-)admit the node.
+ * Used both at init and for live reconfiguration; the caller serializes it.
+ */
+static int mxl371x_apply_config(struct phy_device *phydev)
 {
+	struct mxl371x_priv *priv = phydev->priv;
 	struct device *dev = &phydev->mdio.dev;
-	u32 mac_hi, mac_lo;
+	struct mxl371x_payloads *pl;
 	u32 rsp[MXL_MOCA_INIT_START_RSP_LEN / 4];
-	u32 *v2;
 	int ret;
 
-	v2 = kmemdup(init_param_v2_payload, sizeof(init_param_v2_payload),
-		     GFP_KERNEL);
-	if (!v2)
+	if (!priv->cfg_ready)
+		return -ENODEV;
+
+	pl = kmalloc(sizeof(*pl), GFP_KERNEL);
+	if (!pl)
 		return -ENOMEM;
 
-	mxl371x_derive_guid(phydev, &mac_hi, &mac_lo);
-	v2[MXL_INITV2_GUID_HI_WORD] = mac_hi;
-	v2[MXL_INITV2_GUID_LO_WORD] = mac_lo;
+	/* Snapshot the editable config under cfg_lock; the long mailbox sends
+	 * below run without it, so concurrent moca_cfg_* reads/writes are not
+	 * blocked for the duration of the apply. */
+	mutex_lock(&priv->cfg_lock);
+	ret = mxl371x_pack_payloads(&priv->cfg_blobs, priv->cfg_guid_hi,
+				    priv->cfg_guid_lo, pl);
+	mutex_unlock(&priv->cfg_lock);
+	if (ret) {
+		dev_warn(dev, "MoCA config blobs malformed (%d)\n", ret);
+		goto out;
+	}
 
 	ret = mxl371x_mbox_cmd(phydev, MXL_MOCA_CMD_INIT_PARAM_V2 & 0xffff,
-			       v2, sizeof(init_param_v2_payload), NULL, 0,
+			       pl->v2, pl->v2_len, NULL, 0,
 			       MXL371X_MBOX_POLL_BOOT);
-	kfree(v2);
 	if (ret < 0)
 		goto fail;
 
 	ret = mxl371x_mbox_cmd(phydev, MXL_MOCA_CMD_RLAPM_V2 & 0xffff,
-			       rlapm_v2_payload, sizeof(rlapm_v2_payload),
-			       NULL, 0, MXL371X_MBOX_POLL_BOOT);
+			       pl->rlapm, pl->rlapm_len, NULL, 0,
+			       MXL371X_MBOX_POLL_BOOT);
 	if (ret < 0)
 		goto fail;
 
 	ret = mxl371x_mbox_cmd(phydev, MXL_MOCA_CMD_SAPM_V2 & 0xffff,
-			       sapm_v2_payload, sizeof(sapm_v2_payload),
-			       NULL, 0, MXL371X_MBOX_POLL_BOOT);
+			       pl->sapm, pl->sapm_len, NULL, 0,
+			       MXL371X_MBOX_POLL_BOOT);
 	if (ret < 0)
 		goto fail;
 
 	ret = mxl371x_mbox_cmd(phydev, MXL_MOCA_CMD_INIT_PARAM_V25 & 0xffff,
-			       init_param_v25_payload,
-			       sizeof(init_param_v25_payload), NULL, 0,
+			       pl->v25, pl->v25_len, NULL, 0,
 			       MXL371X_MBOX_POLL_BOOT);
 	if (ret < 0)
 		goto fail;
@@ -1490,17 +1756,71 @@ static int mxl371x_send_config(struct phy_device *phydev)
 	/* rsp word[0] (socGetStatusRsp.status): non-zero = system started. */
 	if (ret >= 4 && rsp[0] == 0) {
 		dev_warn(dev, "MoCA system start not admitted (status 0)\n");
-		return -EAGAIN;
+		ret = -EAGAIN;
+		goto out;
 	}
 	dev_info(dev, "MoCA system started\n");
-	return 0;
+	ret = 0;
+	goto out;
 
 fail:
 	dev_warn(dev, "MoCA config sequence failed: %d\n", ret);
+out:
+	kfree(pl);
 	return ret;
 }
 
-static int mxl371x_load_firmware(struct phy_device *phydev)
+/*
+ * Load the config blobs once and retain private copies so the boot config can
+ * be repacked and re-sent later (live reconfiguration).  The GUID is derived
+ * once here; clink stays editable in place via the moca_cfg_* attrs.
+ */
+static int mxl371x_send_config(struct phy_device *phydev)
+{
+	struct mxl371x_priv *priv = phydev->priv;
+	struct device *dev = &phydev->mdio.dev;
+	const struct firmware *fws[ARRAY_SIZE(mxl371x_blob_names)] = {};
+	/* One slot per blob, in the same order as mxl371x_blob_names. */
+	struct mxl371x_blob *blob[] = {
+		&priv->cfg_blobs.clink, &priv->cfg_blobs.mcast,
+		&priv->cfg_blobs.rlapm, &priv->cfg_blobs.endet,
+		&priv->cfg_blobs.sapm,  &priv->cfg_blobs.rssi,
+		&priv->cfg_blobs.platform,
+	};
+	int ret, i;
+
+	BUILD_BUG_ON(ARRAY_SIZE(blob) != ARRAY_SIZE(mxl371x_blob_names));
+
+	for (i = 0; i < ARRAY_SIZE(mxl371x_blob_names); i++) {
+		ret = request_firmware(&fws[i], mxl371x_blob_names[i], dev);
+		if (ret) {
+			dev_warn(dev, "missing MoCA config blob %s: %d\n",
+				 mxl371x_blob_names[i], ret);
+			goto release;
+		}
+		blob[i]->data = devm_kmemdup(dev, fws[i]->data, fws[i]->size,
+					     GFP_KERNEL);
+		if (!blob[i]->data) {
+			ret = -ENOMEM;
+			goto release;
+		}
+		blob[i]->len = fws[i]->size;
+	}
+	/* clink is the editable blob; keep a writable handle to its copy. */
+	priv->clink_cfg = (u8 *)priv->cfg_blobs.clink.data;
+
+	mxl371x_derive_guid(phydev, &priv->cfg_guid_hi, &priv->cfg_guid_lo);
+	priv->cfg_ready = true;
+
+	ret = mxl371x_apply_config(phydev);
+
+release:
+	for (i = 0; i < ARRAY_SIZE(mxl371x_blob_names); i++)
+		release_firmware(fws[i]);
+	return ret;
+}
+
+static int mxl371x_load_firmware(struct phy_device *phydev, bool force)
 {
 	struct mxl371x_priv *priv = phydev->priv;
 	const struct firmware *fw;
@@ -1510,15 +1830,20 @@ static int mxl371x_load_firmware(struct phy_device *phydev)
 	u32 *chunk = NULL;
 	int ret;
 
-	/* Check if already loaded */
-	if (priv->fw_loaded)
-		return 0;
+	/*
+	 * Normally skip if the firmware is already loaded/running (warm boot).
+	 * A forced reload (live reconfiguration) bypasses both checks: it tears
+	 * the running firmware down and re-downloads so the new config applies.
+	 */
+	if (!force) {
+		if (priv->fw_loaded)
+			return 0;
 
-	/* Check if firmware is already running (warm boot) */
-	if (mxl371x_check_firmware_running(phydev)) {
-		priv->fw_loaded = true;
-		dev_info(dev, "Skipping firmware load (already running)\n");
-		return 0;
+		if (mxl371x_check_firmware_running(phydev)) {
+			priv->fw_loaded = true;
+			dev_info(dev, "Skipping firmware load (already running)\n");
+			return 0;
+		}
 	}
 
 	dev_info(dev, "Loading firmware %s...\n", priv->fw_name);
@@ -1720,6 +2045,60 @@ release_fw:
 	return ret;
 }
 
+/*
+ * Apply the staged configuration: a running MoCA SoC rejects boot-config
+ * commands, so the only way to apply a moca_cfg_* change is a full
+ * re-initialisation -- tear the firmware down, reload it, and re-send the
+ * config repacked from the (edited) retained blobs, then re-admit.  The coax
+ * link drops for the duration.  apply_lock serialises concurrent re-inits;
+ * cfg_lock is taken only briefly (inside apply_config) to snapshot the config,
+ * so it is not held across the multi-second firmware reload.
+ */
+static int mxl371x_reinit(struct phy_device *phydev)
+{
+	struct mxl371x_priv *priv = phydev->priv;
+	struct device *dev = &phydev->mdio.dev;
+	int ret = -EIO, attempt;
+
+	/* cfg_ready latches true once at probe and is never cleared. */
+	if (!priv->cfg_ready)
+		return -ENODEV;
+
+	mutex_lock(&priv->apply_lock);
+	dev_info(dev, "Applying MoCA config: re-initialising SoC\n");
+
+	/* Quiesce the status poll so it does not race the re-init mailbox use. */
+	cancel_delayed_work_sync(&priv->stats_poll);
+
+	/* The boot path can occasionally fail to start the CPU; retry once so a
+	 * transient glitch does not leave MoCA torn down. */
+	for (attempt = 0; attempt < 2; attempt++) {
+		priv->fw_loaded = false;
+		priv->mbox_ready = false;
+		ret = mxl371x_load_firmware(phydev, true);
+		if (ret == 0 && priv->mbox_ready)
+			break;
+		dev_warn(dev, "SoC re-init attempt %d failed (%d)\n",
+			 attempt + 1, ret);
+	}
+
+	if (ret < 0 || !priv->mbox_ready) {
+		dev_err(dev, "SoC re-init failed; MoCA management down -- reflash or re-apply\n");
+		if (ret == 0)
+			ret = -EIO;
+		goto out;
+	}
+
+	ret = mxl371x_apply_config(phydev);
+	if (ret == 0)
+		mxl371x_read_moca_status(phydev);
+
+out:
+	schedule_delayed_work(&priv->stats_poll, HZ);
+	mutex_unlock(&priv->apply_lock);
+	return ret;
+}
+
 /* Detect current SGMII/HSGMII configuration from hardware */
 static int mxl371x_detect_sgmii_mode(struct phy_device *phydev, u8 *detected_mode)
 {
@@ -1867,7 +2246,7 @@ static int mxl371x_config_init(struct phy_device *phydev)
 	 * MoCA management firmware, so log honestly and continue rather than
 	 * failing the PHY probe.  priv->fw_loaded reflects the real state.
 	 */
-	ret = mxl371x_load_firmware(phydev);
+	ret = mxl371x_load_firmware(phydev, false);
 	if (ret < 0)
 		dev_warn(dev, "Firmware not confirmed running (%d); MoCA management unavailable, link may still work\n",
 			 ret);
@@ -1932,6 +2311,8 @@ static int mxl371x_probe(struct phy_device *phydev)
 	phydev->priv = priv;
 	priv->phydev = phydev;
 	mutex_init(&priv->mbox_lock);
+	mutex_init(&priv->cfg_lock);
+	mutex_init(&priv->apply_lock);
 	INIT_DELAYED_WORK(&priv->stats_poll, mxl371x_stats_poll_work);
 	return 0;
 }
@@ -2009,13 +2390,17 @@ static int mxl371x_get_features(struct phy_device *phydev)
 {
 	/* MoCA is a fixed-speed backplane-style interface; standard copper
 	 * autoneg registers are not implemented.  Declare exactly what this
-	 * chip supports so phylink validation passes. */
+	 * chip supports so phylink validation passes.  The host-side serdes
+	 * runs at 2500/1000baseX (HSGMII/SGMII), but the PHY's line side is
+	 * coax, so report the medium as BNC -- the wire type is a property of
+	 * the PHY, independent of how the host attaches to it. */
 	linkmode_zero(phydev->supported);
 	linkmode_set_bit(ETHTOOL_LINK_MODE_2500baseX_Full_BIT, phydev->supported);
 	linkmode_set_bit(ETHTOOL_LINK_MODE_1000baseX_Full_BIT, phydev->supported);
-	linkmode_set_bit(ETHTOOL_LINK_MODE_FIBRE_BIT, phydev->supported);
+	linkmode_set_bit(ETHTOOL_LINK_MODE_BNC_BIT, phydev->supported);
 	linkmode_set_bit(ETHTOOL_LINK_MODE_Pause_BIT, phydev->supported);
 	linkmode_set_bit(ETHTOOL_LINK_MODE_Asym_Pause_BIT, phydev->supported);
+	phydev->port = PORT_BNC;
 	return 0;
 }
 
