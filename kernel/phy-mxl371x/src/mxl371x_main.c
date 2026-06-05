@@ -2230,7 +2230,12 @@ static int mxl371x_config_sgmii(struct phy_device *phydev)
 		dev_info(dev, "Using SGMII mode from device tree (1000Mbps)\n");
 		break;
 
+	case PHY_INTERFACE_MODE_HSGMII:
 	case PHY_INTERFACE_MODE_2500BASEX:
+		/* HSGMII is the MoCA backhaul's true 2.5G SGMII mode; the
+		 * switch SerDes is brought up in the matching HISGMII PCS.
+		 * 2500BASEX is accepted as an alias for boards that can't yet
+		 * express HSGMII in phy-mode. */
 		mode = MXL371X_SGMII_MODE_HSGMII;
 		phydev->speed = SPEED_2500;
 		mode_set = true;
