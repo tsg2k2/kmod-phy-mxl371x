@@ -785,6 +785,20 @@ static void mxl371x_stats_poll_work(struct work_struct *work)
 			mxl371x_update_stats(phydev);
 	}
 
+	/* DIAG: track the host-interface mode register; log only when it
+	 * changes so we catch a runtime revert of HSGMII without spamming. */
+	{
+		static int last_sgmii_ctrl = -1;
+		int cur = phy_read_paged(phydev, MXL371X_SGMII_CTRL, 0x10);
+
+		if (cur != last_sgmii_ctrl) {
+			dev_info(&phydev->mdio.dev,
+				 "DIAG SGMII_CTRL(0xa000/0x10) now=0x%04x (was 0x%04x)\n",
+				 cur, last_sgmii_ctrl);
+			last_sgmii_ctrl = cur;
+		}
+	}
+
 	schedule_delayed_work(&priv->stats_poll, delay);
 }
 
@@ -2290,6 +2304,15 @@ static int mxl371x_config_sgmii(struct phy_device *phydev)
 		return ret;
 	}
 
+	/* DIAG: read the host-interface mode register back so we can confirm
+	 * (in dmesg) the MXL actually latched HSGMII (0x03) and didn't revert. */
+	{
+		int rb = phy_read_paged(phydev, MXL371X_SGMII_CTRL, 0x10);
+
+		dev_info(dev, "DIAG SGMII_CTRL(0xa000/0x10) readback=0x%04x wrote_mode=0x%02x\n",
+			 rb, mode);
+	}
+
 	phydev->duplex = DUPLEX_FULL;
 	priv->backhaul_speed = phydev->speed;
 	dev_info(dev, "Configured %s @ %dMbps\n",
@@ -2539,6 +2562,10 @@ static struct phy_driver mxl371x_drivers[] = {
 		.resume		= mxl371x_resume,
 		.read_page	= mxl371x_read_page,
 		.write_page	= mxl371x_write_page,
+		/* C22 regs 13/14 are the MXL mailbox window, not MMD
+		 * access regs - block phylib's indirect MMD fallback. */
+		.read_mmd	= genphy_read_mmd_unsupported,
+		.write_mmd	= genphy_write_mmd_unsupported,
 	}, {
 		PHY_ID_MATCH_EXACT(MXL3711_PHY_ID),
 		.name		= "MaxLinear MXL3711 MoCA 2.5",
@@ -2556,6 +2583,10 @@ static struct phy_driver mxl371x_drivers[] = {
 		.resume		= mxl371x_resume,
 		.read_page	= mxl371x_read_page,
 		.write_page	= mxl371x_write_page,
+		/* C22 regs 13/14 are the MXL mailbox window, not MMD
+		 * access regs - block phylib's indirect MMD fallback. */
+		.read_mmd	= genphy_read_mmd_unsupported,
+		.write_mmd	= genphy_write_mmd_unsupported,
 	}, {
 		.match_phy_device = mxl371x_match_phy_device,
 		.name		= "MaxLinear MXL371x MoCA 2.5",
@@ -2573,6 +2604,10 @@ static struct phy_driver mxl371x_drivers[] = {
 		.resume		= mxl371x_resume,
 		.read_page	= mxl371x_read_page,
 		.write_page	= mxl371x_write_page,
+		/* C22 regs 13/14 are the MXL mailbox window, not MMD
+		 * access regs - block phylib's indirect MMD fallback. */
+		.read_mmd	= genphy_read_mmd_unsupported,
+		.write_mmd	= genphy_write_mmd_unsupported,
 	},
 };
 
