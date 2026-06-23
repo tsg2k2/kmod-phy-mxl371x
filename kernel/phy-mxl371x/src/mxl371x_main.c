@@ -183,6 +183,19 @@
 #define MXL_MOCA_NI_OFF_MOCAVER		0x10	/* &0xff (OEM netInfo word 4) */
 
 /*
+ * Issue a MoCA reset to remote node(s) over the L2ME management plane (the
+ * standard way to manage other adapters on the coax -- no IP needed).  Request
+ * is three LE words {LOF(MHz), nodemask, delay_seconds}; the SoC then emits the
+ * L2ME reset to every node selected in the bitmask.  Response word0 is the
+ * MoCA-reset result code: 1 or 2 = accepted, anything else = failure.
+ */
+#define MXL_MOCA_CMD_ISSUE_RESET	0x1010055
+#define MXL_MOCA_RESET_REQ_LEN		0x0c	/* {lof, nodemask, seconds} */
+#define MXL_MOCA_RESET_RSP_LEN		0x8c	/* 140 bytes */
+#define MXL_MOCA_RESET_OK1		1
+#define MXL_MOCA_RESET_OK2		2
+
+/*
  * Per-link PHY-rate (FMR) report.  The coax PHY rate is per-peer, asymmetric
  * and dynamic (~3.5 Gbps for MoCA 2.5) -- it is reported via sysfs / ethtool
  * -S, NOT as the (fixed) Ethernet interface speed.  Payload = [node_bitmask,
@@ -1144,6 +1157,56 @@ static ssize_t moca_nodes_show(struct device *dev,
 }
 static DEVICE_ATTR_RO(moca_nodes);
 
+/*
+ * Reset remote MoCA node(s) over L2ME -- the OEM "clnkrst -m <nodemask>" path,
+ * and the vendor-agnostic way to manage other adapters on the coax that expose
+ * no IP.  Write "<nodemask> [seconds]" (nodemask hex or decimal, one bit per
+ * node id; optional delay).  Our own node bit is always cleared so we never
+ * reset ourselves.
+ */
+static ssize_t moca_node_reset_store(struct device *dev,
+				     struct device_attribute *attr,
+				     const char *buf, size_t count)
+{
+	struct phy_device *phydev = to_phy_device(dev);
+	struct mxl371x_priv *priv = phydev->priv;
+	u32 pl[MXL_MOCA_RESET_REQ_LEN / 4];
+	u32 rsp[MXL_MOCA_RESET_RSP_LEN / 4];
+	unsigned int nodemask, secs = 0;
+	int ret;
+
+	if (sscanf(buf, "%i %u", &nodemask, &secs) < 1)
+		return -EINVAL;
+
+	nodemask &= ~BIT(priv->node_id);	/* never reset ourselves */
+	nodemask &= 0xffff;			/* 16 nodes max */
+	if (!nodemask)
+		return -EINVAL;
+	if (!priv->mbox_ready)
+		return -ENODEV;
+
+	pl[0] = priv->lof;	/* LOF (MHz) */
+	pl[1] = nodemask;	/* nodes to reset */
+	pl[2] = secs;		/* delay seconds */
+
+	ret = mxl371x_mbox_cmd(phydev, MXL_MOCA_CMD_ISSUE_RESET & 0xffff,
+			       pl, sizeof(pl), rsp, ARRAY_SIZE(rsp),
+			       MXL371X_MBOX_POLL_BOOT);
+	if (ret < 4)
+		return ret < 0 ? ret : -EIO;
+
+	if (rsp[0] != MXL_MOCA_RESET_OK1 && rsp[0] != MXL_MOCA_RESET_OK2) {
+		dev_warn(dev, "MoCA reset nodemask=0x%x rejected (code %u)\n",
+			 nodemask, rsp[0]);
+		return -EIO;
+	}
+
+	dev_info(dev, "Issued MoCA reset nodemask=0x%x lof=%u secs=%u (code %u)\n",
+		 nodemask, priv->lof, secs, rsp[0]);
+	return count;
+}
+static DEVICE_ATTR_WO(moca_node_reset);
+
 static ssize_t moca_node_id_show(struct device *dev,
 				 struct device_attribute *attr, char *buf)
 {
@@ -1626,6 +1689,7 @@ static struct attribute *mxl371x_attrs[] = {
 	&dev_attr_moca_phy_rate.attr,
 	&dev_attr_moca_phy_rates.attr,
 	&dev_attr_moca_nodes.attr,
+	&dev_attr_moca_node_reset.attr,
 	&dev_attr_moca_node_id.attr,
 	&dev_attr_moca_nc_node_id.attr,
 	&dev_attr_moca_lof.attr,
