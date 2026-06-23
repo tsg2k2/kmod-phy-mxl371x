@@ -161,6 +161,28 @@
 #define MXL_MOCA_LOF_OFF_LOF		0x04
 
 /*
+ * Per-node network info (GetNetInfo).  Payload = node index; the response
+ * carries that node's identity -- its GUID (eMacAddr hi/lo) and MoCA version --
+ * for every node on the coax, including remote peers.  This is what lets the
+ * router enumerate the other adapters by their stable GUID regardless of IP.
+ *
+ * The OEM web UI exposes the same data as bank-0 param 0x16, and on this SoC the
+ * web param id IS the mailbox command's low 16 bits (0x15=GetLocalInfo,
+ * 0x1d=GetFmrInfo, 0x24=GetLof), so 0x16 == GetNetInfo.
+ *
+ * GUID/version offsets are taken from the OEM web decode (netInfo[4]&0xff =
+ * version).  The GUID offset still wants one on-silicon confirmation: the self
+ * row cross-checks it for free (GetNetInfo GUID for our own node must equal the
+ * configured GUID).  A wrong offset only blanks the guid (it is sanity-filtered
+ * to a plausible unicast MAC), so it can never publish garbage or misbehave.
+ */
+#define MXL_MOCA_CMD_GET_NET_INFO	0x1010016
+#define MXL_MOCA_NET_INFO_RSP_LEN	0x60
+#define MXL_MOCA_NI_OFF_GUID_HI		0x00	/* eMacAddrHi */
+#define MXL_MOCA_NI_OFF_GUID_LO		0x04	/* eMacAddrLo (top 16 bits used) */
+#define MXL_MOCA_NI_OFF_MOCAVER		0x10	/* &0xff (OEM netInfo word 4) */
+
+/*
  * Per-link PHY-rate (FMR) report.  The coax PHY rate is per-peer, asymmetric
  * and dynamic (~3.5 Gbps for MoCA 2.5) -- it is reported via sysfs / ethtool
  * -S, NOT as the (fixed) Ethernet interface speed.  Payload = [node_bitmask,
@@ -324,6 +346,10 @@ struct mxl371x_priv {
 	u32 lof;
 	u32 network_state;
 	u32 active_nodes;
+	/* Per-node census (GetNetInfo), indexed by MoCA node id. */
+	u8 node_guid[MXL_MOCA_MAX_NODES][ETH_ALEN];
+	bool node_guid_valid[MXL_MOCA_MAX_NODES];
+	u8 node_moca_ver[MXL_MOCA_MAX_NODES];
 	bool security_enabled;
 	const char *fw_name;
 	char soc_version[64];
@@ -714,6 +740,50 @@ static void mxl371x_read_phy_rates(struct phy_device *phydev)
 }
 
 /*
+ * Read the per-node census (GetNetInfo) for every active node: GUID + MoCA
+ * version, so the router can enumerate the other MoCA adapters by their stable
+ * GUID.  Cached into priv and surfaced via the moca_nodes sysfs attribute.
+ */
+static void mxl371x_read_node_info(struct phy_device *phydev)
+{
+	struct mxl371x_priv *priv = phydev->priv;
+	u32 active = priv->active_nodes;
+	int n;
+
+	for (n = 0; n < MXL_MOCA_MAX_NODES; n++) {
+		u32 rsp[MXL_MOCA_NET_INFO_RSP_LEN / 4];
+		u32 pl = n, hi, lo;
+		u8 g[ETH_ALEN];
+		int ret;
+
+		priv->node_guid_valid[n] = false;
+		priv->node_moca_ver[n] = 0;
+		if (!(active & BIT(n)))
+			continue;
+
+		ret = mxl371x_mbox_cmd(phydev, MXL_MOCA_CMD_GET_NET_INFO & 0xffff,
+				       &pl, sizeof(pl), rsp, ARRAY_SIZE(rsp),
+				       MXL371X_MBOX_POLL_STATUS);
+		if (ret < MXL_MOCA_NI_OFF_MOCAVER + 4)
+			continue;
+
+		priv->node_moca_ver[n] = rsp[MXL_MOCA_NI_OFF_MOCAVER / 4] & 0xff;
+
+		hi = rsp[MXL_MOCA_NI_OFF_GUID_HI / 4];
+		lo = rsp[MXL_MOCA_NI_OFF_GUID_LO / 4];
+		g[0] = hi >> 24; g[1] = hi >> 16; g[2] = hi >> 8; g[3] = hi;
+		g[4] = lo >> 24; g[5] = lo >> 16;
+
+		/* Publish only a plausible unicast GUID, so an unconfirmed
+		 * offset blanks the field rather than printing junk. */
+		if (!is_zero_ether_addr(g) && !is_multicast_ether_addr(g)) {
+			memcpy(priv->node_guid[n], g, ETH_ALEN);
+			priv->node_guid_valid[n] = true;
+		}
+	}
+}
+
+/*
  * Update MoCA link state over the mailbox.  An earlier approach read the
  * 0x0c1000xx link-state registers directly, but on running firmware those
  * return "engine busy" -- live state is only available through mailbox
@@ -756,10 +826,13 @@ static int mxl371x_read_moca_status(struct phy_device *phydev)
 			priv->lof = lof[MXL_MOCA_LOF_OFF_LOF / 4];
 
 		mxl371x_read_phy_rates(phydev);
+		mxl371x_read_node_info(phydev);
 	} else {
 		priv->phy_rate = 0;
 		memset(priv->phy_rate_tx, 0, sizeof(priv->phy_rate_tx));
 		memset(priv->phy_rate_rx, 0, sizeof(priv->phy_rate_rx));
+		memset(priv->node_guid_valid, 0, sizeof(priv->node_guid_valid));
+		memset(priv->node_moca_ver, 0, sizeof(priv->node_moca_ver));
 	}
 
 	return 0;
@@ -1014,6 +1087,62 @@ static ssize_t moca_phy_rates_show(struct device *dev,
 	return len;
 }
 static DEVICE_ATTR_RO(moca_phy_rates);
+
+/*
+ * Per-node census of the whole MoCA network: one line per active node with its
+ * role, MoCA version, coax PHY rates and GUID.  This is the router-side,
+ * vendor-agnostic discovery surface -- it lists every other adapter on the coax
+ * by its stable GUID, with no IP needed (userspace maps GUID->IP via the bridge
+ * FDB / DHCP leases to then reach each adapter's HTTP API).
+ *   node<N> role=<self|nc|peer> moca=<x.y> tx=<mbps> rx=<mbps> guid=<MAC|unknown>
+ */
+static ssize_t moca_nodes_show(struct device *dev,
+			       struct device_attribute *attr, char *buf)
+{
+	struct mxl371x_priv *priv = to_phy_device(dev)->priv;
+	int n, len = 0;
+
+	for (n = 0; n < MXL_MOCA_MAX_NODES; n++) {
+		const char *role;
+		u8 ver;
+
+		if (!(priv->active_nodes & BIT(n)))
+			continue;
+
+		role = (n == priv->node_id) ? "self" :
+		       (n == priv->nc_node_id) ? "nc" : "peer";
+
+		/* Self falls back to the locally-known version if GetNetInfo
+		 * did not report one. */
+		ver = priv->node_moca_ver[n];
+		if (!ver && n == priv->node_id)
+			ver = priv->moca_version;
+
+		len += sprintf(buf + len,
+			       "node%d role=%s moca=%u.%u tx=%u rx=%u guid=",
+			       n, role, (ver >> 4) & 0xf, ver & 0xf,
+			       priv->phy_rate_tx[n], priv->phy_rate_rx[n]);
+
+		if (priv->node_guid_valid[n]) {
+			len += sprintf(buf + len, "%pM\n", priv->node_guid[n]);
+		} else if (n == priv->node_id && priv->cfg_ready) {
+			/* Our own GUID is known from the boot config; print it so
+			 * the self row is always populated (and so it can be
+			 * diffed against the GetNetInfo value to confirm the
+			 * GUID offset on silicon). */
+			u8 m[ETH_ALEN] = {
+				priv->cfg_guid_hi >> 24, priv->cfg_guid_hi >> 16,
+				priv->cfg_guid_hi >> 8,  priv->cfg_guid_hi,
+				priv->cfg_guid_lo >> 24, priv->cfg_guid_lo >> 16,
+			};
+			len += sprintf(buf + len, "%pM\n", m);
+		} else {
+			len += sprintf(buf + len, "unknown\n");
+		}
+	}
+	return len;
+}
+static DEVICE_ATTR_RO(moca_nodes);
 
 static ssize_t moca_node_id_show(struct device *dev,
 				 struct device_attribute *attr, char *buf)
@@ -1496,6 +1625,7 @@ static struct attribute *mxl371x_attrs[] = {
 	&dev_attr_moca_version.attr,
 	&dev_attr_moca_phy_rate.attr,
 	&dev_attr_moca_phy_rates.attr,
+	&dev_attr_moca_nodes.attr,
 	&dev_attr_moca_node_id.attr,
 	&dev_attr_moca_nc_node_id.attr,
 	&dev_attr_moca_lof.attr,
