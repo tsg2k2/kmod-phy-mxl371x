@@ -206,7 +206,8 @@
  *   0x1010030 sleep (4/8)                 0x1010031 wake (0/8)
  *   0x1010055 issue MoCA reset (12/0x8c)  0x1010016 per-node net info
  */
-#define MXL_MOCA_CMD_MAX_WORDS		64
+#define MXL_MOCA_CMD_REQ_WORDS		64	/* request: cmdid + payload */
+#define MXL_MOCA_CMD_RSP_WORDS		512	/* response (covers the 1616B data-stats) */
 
 /*
  * Per-link PHY-rate (FMR) report.  The coax PHY rate is per-peer, asymmetric
@@ -378,7 +379,7 @@ struct mxl371x_priv {
 	u8 node_moca_ver[MXL_MOCA_MAX_NODES];
 	/* Last response from the generic moca_cmd L2ME passthrough. */
 	struct mutex cmd_lock;
-	u32 cmd_rsp[MXL_MOCA_CMD_MAX_WORDS];
+	u32 cmd_rsp[MXL_MOCA_CMD_RSP_WORDS];
 	int cmd_rsp_bytes;
 	bool security_enabled;
 	const char *fw_name;
@@ -1236,13 +1237,12 @@ static ssize_t moca_cmd_store(struct device *dev, struct device_attribute *attr,
 {
 	struct phy_device *phydev = to_phy_device(dev);
 	struct mxl371x_priv *priv = phydev->priv;
-	u32 words[MXL_MOCA_CMD_MAX_WORDS];
-	u32 rsp[MXL_MOCA_CMD_MAX_WORDS];
+	u32 words[MXL_MOCA_CMD_REQ_WORDS];
 	int nwords = 0, ret;
 	const char *p = buf;
 
 	/* parse whitespace-separated hex words: words[0]=cmdid, [1..]=payload */
-	while (*p && nwords < MXL_MOCA_CMD_MAX_WORDS) {
+	while (*p && nwords < MXL_MOCA_CMD_REQ_WORDS) {
 		char *end;
 		unsigned long v;
 
@@ -1261,16 +1261,17 @@ static ssize_t moca_cmd_store(struct device *dev, struct device_attribute *attr,
 	if (!priv->mbox_ready)
 		return -ENODEV;
 
+	/* Read straight into the (large) priv response buffer under the lock so
+	 * full-size responses (e.g. the 1616-byte data stats) are captured. */
+	mutex_lock(&priv->cmd_lock);
 	ret = mxl371x_mbox_cmd(phydev, words[0] & 0xffff,
 			       nwords > 1 ? &words[1] : NULL, (nwords - 1) * 4,
-			       rsp, ARRAY_SIZE(rsp), MXL371X_MBOX_POLL_BOOT);
+			       priv->cmd_rsp, MXL_MOCA_CMD_RSP_WORDS,
+			       MXL371X_MBOX_POLL_BOOT);
+	priv->cmd_rsp_bytes = (ret > 0) ? min_t(int, ret, (int)sizeof(priv->cmd_rsp)) : 0;
+	mutex_unlock(&priv->cmd_lock);
 	if (ret < 0)
 		return ret;
-
-	mutex_lock(&priv->cmd_lock);
-	priv->cmd_rsp_bytes = min_t(int, ret, (int)sizeof(priv->cmd_rsp));
-	memcpy(priv->cmd_rsp, rsp, priv->cmd_rsp_bytes);
-	mutex_unlock(&priv->cmd_lock);
 
 	dev_dbg(dev, "moca_cmd 0x%x -> %d bytes\n", words[0], ret);
 	return count;
@@ -1285,8 +1286,9 @@ static ssize_t moca_cmd_show(struct device *dev, struct device_attribute *attr,
 	mutex_lock(&priv->cmd_lock);
 	n = priv->cmd_rsp_bytes / 4;
 	len += sprintf(buf + len, "%d", priv->cmd_rsp_bytes);
-	for (i = 0; i < n; i++)
-		len += sprintf(buf + len, " 0x%08x", priv->cmd_rsp[i]);
+	/* Compact "%08x" (no 0x) so a full-size response fits one sysfs page. */
+	for (i = 0; i < n && len < PAGE_SIZE - 16; i++)
+		len += sprintf(buf + len, " %08x", priv->cmd_rsp[i]);
 	mutex_unlock(&priv->cmd_lock);
 
 	len += sprintf(buf + len, "\n");
