@@ -196,6 +196,19 @@
 #define MXL_MOCA_RESET_OK2		2
 
 /*
+ * Generic L2ME/MoCA command passthrough (moca_cmd sysfs).  The SoC mailbox is
+ * the same transport the OEM clink stack drives for every DCAP get/set, so a
+ * raw "<cmdid> [words...]" -> response channel exposes them all to a management
+ * tool.  Known command ids (req/resp bytes), for reference:
+ *   0x1010009 get beacon power (0/8)      0x1010008 set beacon power (8/4)
+ *   0x1010020 get tx power (12/0x13c)     0x1010067 set/get tx-power var (12/4)
+ *   0x1010022 per-node PHY (4/0x14)       0x1010056 L2ME stats (4/0x10)
+ *   0x1010030 sleep (4/8)                 0x1010031 wake (0/8)
+ *   0x1010055 issue MoCA reset (12/0x8c)  0x1010016 per-node net info
+ */
+#define MXL_MOCA_CMD_MAX_WORDS		64
+
+/*
  * Per-link PHY-rate (FMR) report.  The coax PHY rate is per-peer, asymmetric
  * and dynamic (~3.5 Gbps for MoCA 2.5) -- it is reported via sysfs / ethtool
  * -S, NOT as the (fixed) Ethernet interface speed.  Payload = [node_bitmask,
@@ -363,6 +376,10 @@ struct mxl371x_priv {
 	u8 node_guid[MXL_MOCA_MAX_NODES][ETH_ALEN];
 	bool node_guid_valid[MXL_MOCA_MAX_NODES];
 	u8 node_moca_ver[MXL_MOCA_MAX_NODES];
+	/* Last response from the generic moca_cmd L2ME passthrough. */
+	struct mutex cmd_lock;
+	u32 cmd_rsp[MXL_MOCA_CMD_MAX_WORDS];
+	int cmd_rsp_bytes;
 	bool security_enabled;
 	const char *fw_name;
 	char soc_version[64];
@@ -1207,6 +1224,76 @@ static ssize_t moca_node_reset_store(struct device *dev,
 }
 static DEVICE_ATTR_WO(moca_node_reset);
 
+/*
+ * Generic L2ME/MoCA command passthrough.  Write "<cmdid> [w0 w1 ...]" (all hex
+ * 32-bit words; first word is the command id, the rest are the request payload)
+ * to issue any SoC/DCAP command; read back "<resp_bytes> <w0> <w1> ..." with the
+ * response words.  This is the full getter/setter surface the OEM clink stack
+ * uses -- root only (the attribute is 0600 via DEVICE_ATTR_RW + the group).
+ */
+static ssize_t moca_cmd_store(struct device *dev, struct device_attribute *attr,
+			      const char *buf, size_t count)
+{
+	struct phy_device *phydev = to_phy_device(dev);
+	struct mxl371x_priv *priv = phydev->priv;
+	u32 words[MXL_MOCA_CMD_MAX_WORDS];
+	u32 rsp[MXL_MOCA_CMD_MAX_WORDS];
+	int nwords = 0, ret;
+	const char *p = buf;
+
+	/* parse whitespace-separated hex words: words[0]=cmdid, [1..]=payload */
+	while (*p && nwords < MXL_MOCA_CMD_MAX_WORDS) {
+		char *end;
+		unsigned long v;
+
+		while (*p == ' ' || *p == '\t' || *p == '\n')
+			p++;
+		if (!*p)
+			break;
+		v = simple_strtoul(p, &end, 16);
+		if (end == p)
+			return -EINVAL;
+		words[nwords++] = (u32)v;
+		p = end;
+	}
+	if (nwords < 1)
+		return -EINVAL;
+	if (!priv->mbox_ready)
+		return -ENODEV;
+
+	ret = mxl371x_mbox_cmd(phydev, words[0] & 0xffff,
+			       nwords > 1 ? &words[1] : NULL, (nwords - 1) * 4,
+			       rsp, ARRAY_SIZE(rsp), MXL371X_MBOX_POLL_BOOT);
+	if (ret < 0)
+		return ret;
+
+	mutex_lock(&priv->cmd_lock);
+	priv->cmd_rsp_bytes = min_t(int, ret, (int)sizeof(priv->cmd_rsp));
+	memcpy(priv->cmd_rsp, rsp, priv->cmd_rsp_bytes);
+	mutex_unlock(&priv->cmd_lock);
+
+	dev_dbg(dev, "moca_cmd 0x%x -> %d bytes\n", words[0], ret);
+	return count;
+}
+
+static ssize_t moca_cmd_show(struct device *dev, struct device_attribute *attr,
+			     char *buf)
+{
+	struct mxl371x_priv *priv = to_phy_device(dev)->priv;
+	int i, n, len = 0;
+
+	mutex_lock(&priv->cmd_lock);
+	n = priv->cmd_rsp_bytes / 4;
+	len += sprintf(buf + len, "%d", priv->cmd_rsp_bytes);
+	for (i = 0; i < n; i++)
+		len += sprintf(buf + len, " 0x%08x", priv->cmd_rsp[i]);
+	mutex_unlock(&priv->cmd_lock);
+
+	len += sprintf(buf + len, "\n");
+	return len;
+}
+static DEVICE_ATTR_RW(moca_cmd);
+
 static ssize_t moca_node_id_show(struct device *dev,
 				 struct device_attribute *attr, char *buf)
 {
@@ -1690,6 +1777,7 @@ static struct attribute *mxl371x_attrs[] = {
 	&dev_attr_moca_phy_rates.attr,
 	&dev_attr_moca_nodes.attr,
 	&dev_attr_moca_node_reset.attr,
+	&dev_attr_moca_cmd.attr,
 	&dev_attr_moca_node_id.attr,
 	&dev_attr_moca_nc_node_id.attr,
 	&dev_attr_moca_lof.attr,
@@ -2609,6 +2697,7 @@ static int mxl371x_probe(struct phy_device *phydev)
 	mutex_init(&priv->mbox_lock);
 	mutex_init(&priv->cfg_lock);
 	mutex_init(&priv->apply_lock);
+	mutex_init(&priv->cmd_lock);
 	INIT_DELAYED_WORK(&priv->stats_poll, mxl371x_stats_poll_work);
 	return 0;
 }
