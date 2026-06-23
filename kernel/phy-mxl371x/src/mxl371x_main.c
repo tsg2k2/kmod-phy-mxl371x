@@ -381,6 +381,9 @@ struct mxl371x_priv {
 	struct mutex cmd_lock;
 	u32 cmd_rsp[MXL_MOCA_CMD_RSP_WORDS];
 	int cmd_rsp_bytes;
+	/* SoC health monitor (GET_SOC_STATUS) */
+	bool soc_healthy;
+	int soc_fail_count;
 	bool security_enabled;
 	const char *fw_name;
 	char soc_version[64];
@@ -869,6 +872,48 @@ static int mxl371x_read_moca_status(struct phy_device *phydev)
 	return 0;
 }
 
+/*
+ * Poll SoC health (GET_SOC_STATUS): word0 == 1 is healthy, word1 is the fatal
+ * code.  Mirrors the OEM daemon -- after a few consecutive unhealthy reads the
+ * firmware has genuinely faulted (e.g. a runtime cal/IQ error) and would stay
+ * dead, so re-initialise the SoC to recover.  A short mailbox hiccup is not
+ * counted (we only act on a clear status != 1).
+ */
+#define MXL_MOCA_SOC_FAIL_LIMIT		3
+static void mxl371x_check_soc_health(struct phy_device *phydev)
+{
+	struct mxl371x_priv *priv = phydev->priv;
+	u32 rsp[MXL_MOCA_SOC_STATUS_RSP_LEN / 4];
+	int ret;
+
+	ret = mxl371x_mbox_cmd(phydev, MXL_MOCA_CMD_GET_SOC_STATUS & 0xffff,
+			       NULL, 0, rsp, ARRAY_SIZE(rsp),
+			       MXL371X_MBOX_POLL_STATUS);
+	if (ret < MXL_MOCA_SOC_STATUS_RSP_LEN)
+		return;		/* transient -- don't penalise a flaky read */
+
+	priv->soc_healthy = (rsp[MXL_MOCA_SOC_STATUS_OFF_STATUS / 4] == 1);
+	if (priv->soc_healthy) {
+		priv->soc_fail_count = 0;
+		return;
+	}
+
+	if (++priv->soc_fail_count < MXL_MOCA_SOC_FAIL_LIMIT) {
+		dev_warn(&phydev->mdio.dev,
+			 "MoCA SoC unhealthy (status=%u fatal=0x%x) %d/%d\n",
+			 rsp[MXL_MOCA_SOC_STATUS_OFF_STATUS / 4],
+			 rsp[MXL_MOCA_SOC_STATUS_OFF_FATAL / 4],
+			 priv->soc_fail_count, MXL_MOCA_SOC_FAIL_LIMIT);
+		return;
+	}
+
+	dev_err(&phydev->mdio.dev,
+		"MoCA SoC fault persisted (fatal=0x%x); re-initialising\n",
+		rsp[MXL_MOCA_SOC_STATUS_OFF_FATAL / 4]);
+	priv->soc_fail_count = 0;
+	mxl371x_reinit(phydev);
+}
+
 static void mxl371x_stats_poll_work(struct work_struct *work)
 {
 	struct mxl371x_priv *priv = container_of(work, struct mxl371x_priv,
@@ -887,6 +932,9 @@ static void mxl371x_stats_poll_work(struct work_struct *work)
 			delay = 30 * HZ;
 		else if (phydev->attached_dev)
 			mxl371x_update_stats(phydev);
+
+		/* Watchdog the SoC and recover it on a persistent fault. */
+		mxl371x_check_soc_health(phydev);
 	}
 
 	/* DIAG: track the host-interface mode register; log only when it
@@ -1370,6 +1418,18 @@ static ssize_t moca_security_enabled_show(struct device *dev,
 }
 static DEVICE_ATTR_RO(moca_security_enabled);
 
+/* SoC health as tracked by the watchdog: "ok" or "fault (N fails)". */
+static ssize_t moca_soc_health_show(struct device *dev,
+				    struct device_attribute *attr, char *buf)
+{
+	struct mxl371x_priv *priv = to_phy_device(dev)->priv;
+
+	if (priv->soc_healthy)
+		return sprintf(buf, "ok\n");
+	return sprintf(buf, "fault (%d fails)\n", priv->soc_fail_count);
+}
+static DEVICE_ATTR_RO(moca_soc_health);
+
 static ssize_t moca_chip_type_show(struct device *dev,
 				   struct device_attribute *attr, char *buf)
 {
@@ -1786,6 +1846,7 @@ static struct attribute *mxl371x_attrs[] = {
 	&dev_attr_moca_network_state.attr,
 	&dev_attr_moca_active_nodes.attr,
 	&dev_attr_moca_security_enabled.attr,
+	&dev_attr_moca_soc_health.attr,
 	&dev_attr_moca_chip_type.attr,
 	&dev_attr_moca_fw_version.attr,
 	&dev_attr_moca_guid.attr,
