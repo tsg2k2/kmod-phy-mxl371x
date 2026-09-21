@@ -7,6 +7,7 @@
  */
 
 #include <linux/module.h>
+#include <linux/version.h>
 #include <linux/phy.h>
 #include <linux/firmware.h>
 #include <linux/delay.h>
@@ -2589,7 +2590,15 @@ static int mxl371x_config_sgmii(struct phy_device *phydev)
 		dev_info(dev, "Using SGMII mode from device tree (1000Mbps)\n");
 		break;
 
+	/* PHY_INTERFACE_MODE_HSGMII is not a mainline phy_interface_t. Our
+	 * 6.12 kernel tree patches it in; the 6.18 tree dropped it again and
+	 * expresses HSGMII as a SerDes lane property instead. The 2500BASEX
+	 * case below covers that tree, so the alias is simply left out there
+	 * rather than failing the build.
+	 */
+#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 13, 0)
 	case PHY_INTERFACE_MODE_HSGMII:
+#endif
 	case PHY_INTERFACE_MODE_2500BASEX:
 		/* HSGMII is the MoCA backhaul's true 2.5G SGMII mode; the
 		 * switch SerDes is brought up in the matching HISGMII PCS.
