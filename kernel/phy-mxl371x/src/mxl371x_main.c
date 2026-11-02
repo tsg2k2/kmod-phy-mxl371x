@@ -22,6 +22,7 @@
 #include <linux/slab.h>
 #include <linux/mutex.h>
 #include <linux/minmax.h>
+#include <linux/unaligned.h>
 
 #include "mxl371x_packer.h"
 
@@ -154,8 +155,11 @@
 #define MXL_MOCA_LI_OFF_LINKSTATUS	0x14	/* 1 = MoCA link up */
 #define MXL_MOCA_LI_OFF_ADM		0x18	/* admission status */
 #define MXL_MOCA_LI_OFF_NETSTATE	0x24
+#define MXL_MOCA_LI_OFF_RESETCNT	0x28	/* link resets since boot */
 #define MXL_MOCA_LI_OFF_MOCAVER		0x2c
 #define MXL_MOCA_LI_OFF_ACTIVEMASK	0x30
+#define MXL_MOCA_LI_OFF_REQSTATUS	0x6c
+#define MXL_MOCA_REQ_PRIVACY		BIT(2)	/* the coax password changed */
 
 #define MXL_MOCA_CMD_GET_LOF		0x1010024
 #define MXL_MOCA_LOF_RSP_LEN		0x08
@@ -167,11 +171,11 @@
  * for every node on the coax, including remote peers.  This is what lets the
  * router enumerate the other adapters by their stable GUID regardless of IP.
  *
- * The OEM web UI exposes the same data as bank-0 param 0x16, and on this SoC the
+ * Adapter web UIs expose the same data as bank-0 param 0x16, and on this SoC the
  * web param id IS the mailbox command's low 16 bits (0x15=GetLocalInfo,
  * 0x1d=GetFmrInfo, 0x24=GetLof), so 0x16 == GetNetInfo.
  *
- * GUID/version offsets are taken from the OEM web decode (netInfo[4]&0xff =
+ * GUID/version offsets are taken from that web decode (netInfo[4]&0xff =
  * version).  The GUID offset still wants one on-silicon confirmation: the self
  * row cross-checks it for free (GetNetInfo GUID for our own node must equal the
  * configured GUID).  A wrong offset only blanks the guid (it is sanity-filtered
@@ -181,7 +185,7 @@
 #define MXL_MOCA_NET_INFO_RSP_LEN	0x60
 #define MXL_MOCA_NI_OFF_GUID_HI		0x00	/* eMacAddrHi */
 #define MXL_MOCA_NI_OFF_GUID_LO		0x04	/* eMacAddrLo (top 16 bits used) */
-#define MXL_MOCA_NI_OFF_MOCAVER		0x10	/* &0xff (OEM netInfo word 4) */
+#define MXL_MOCA_NI_OFF_MOCAVER		0x10	/* &0xff (netInfo word 4) */
 
 /*
  * Issue a MoCA reset to remote node(s) over the L2ME management plane (the
@@ -198,7 +202,7 @@
 
 /*
  * Generic L2ME/MoCA command passthrough (moca_cmd sysfs).  The SoC mailbox is
- * the same transport the OEM clink stack drives for every DCAP get/set, so a
+ * the same transport every get/set in the firmware API uses, so a
  * raw "<cmdid> [words...]" -> response channel exposes them all to a management
  * tool.  Known command ids (req/resp bytes), for reference:
  *   0x1010009 get beacon power (0/8)      0x1010008 set beacon power (8/4)
@@ -226,6 +230,7 @@
 #define MXL_MOCA_FMR_TYPE_DETAILED	2
 #define MXL_MOCA_FMR_NODELIST_OFF	0x08
 #define MXL_MOCA_FMR_DATA_OFF		0x28
+#define MXL_MOCA_RATES_MAX_AGE		(60 * HZ)
 #define MXL_MOCA_MAX_NODES		16
 
 /*
@@ -385,6 +390,13 @@ struct mxl371x_priv {
 	/* SoC health monitor (GET_SOC_STATUS) */
 	bool soc_healthy;
 	int soc_fail_count;
+	int mbox_fail_count;
+	u32 adm_status;
+	u32 link_resets;
+	u32 req_status;
+	unsigned long rates_stamp;	/* jiffies of the last rate/census read */
+	struct mutex rates_lock;
+	struct delayed_work recover_work;
 	bool security_enabled;
 	const char *fw_name;
 	char soc_version[64];
@@ -827,10 +839,26 @@ static void mxl371x_read_node_info(struct phy_device *phydev)
  * GET_LOCAL_INFO carries the link-up flag (and admission status); GET_LOF gives
  * the last operating frequency once the link is up.  Returns 0 on success.
  */
+static void mxl371x_refresh_rates(struct phy_device *phydev, bool force)
+{
+	struct mxl371x_priv *priv = phydev->priv;
+
+	mutex_lock(&priv->rates_lock);
+	if (priv->mbox_ready && priv->link_status == MOCA_LINK_UP &&
+	    (force || time_after(jiffies, priv->rates_stamp + HZ))) {
+		mxl371x_read_phy_rates(phydev);
+		mxl371x_read_node_info(phydev);
+		priv->rates_stamp = jiffies;
+	}
+	mutex_unlock(&priv->rates_lock);
+}
+
 static int mxl371x_read_moca_status(struct phy_device *phydev)
 {
 	struct mxl371x_priv *priv = phydev->priv;
 	u32 rsp[MXL_MOCA_LOCAL_INFO_RSP_LEN / 4];
+	u32 old_active, req;
+	bool was_up;
 	int ret;
 
 	if (!priv->mbox_ready)
@@ -842,13 +870,27 @@ static int mxl371x_read_moca_status(struct phy_device *phydev)
 	if (ret < MXL_MOCA_LOCAL_INFO_RSP_LEN)
 		return ret < 0 ? ret : -EIO;
 
+	was_up = priv->link_status == MOCA_LINK_UP;
+	old_active = priv->active_nodes;
+	req = rsp[MXL_MOCA_LI_OFF_REQSTATUS / 4];
+
 	priv->link_status = (rsp[MXL_MOCA_LI_OFF_LINKSTATUS / 4] == 1) ?
 			    MOCA_LINK_UP : MOCA_LINK_DOWN;
+	priv->adm_status   = rsp[MXL_MOCA_LI_OFF_ADM / 4];
+	priv->link_resets  = rsp[MXL_MOCA_LI_OFF_RESETCNT / 4];
 	priv->node_id      = rsp[MXL_MOCA_LI_OFF_NODE_ID / 4];
 	priv->nc_node_id   = rsp[MXL_MOCA_LI_OFF_NC_NODE_ID / 4];
 	priv->network_state = rsp[MXL_MOCA_LI_OFF_NETSTATE / 4];
 	priv->moca_version = rsp[MXL_MOCA_LI_OFF_MOCAVER / 4];
 	priv->active_nodes = rsp[MXL_MOCA_LI_OFF_ACTIVEMASK / 4];
+
+	/* Pairing moved the coax password: userspace has to save it. */
+	if ((req & ~priv->req_status) & MXL_MOCA_REQ_PRIVACY) {
+		char *env[] = { "MOCA_EVENT=privacy", NULL };
+
+		kobject_uevent_env(&phydev->mdio.dev.kobj, KOBJ_CHANGE, env);
+	}
+	priv->req_status = req;
 
 	/* LOF and per-link PHY rates are only meaningful once the link is up. */
 	if (priv->link_status == MOCA_LINK_UP) {
@@ -860,8 +902,13 @@ static int mxl371x_read_moca_status(struct phy_device *phydev)
 		    MXL_MOCA_LOF_RSP_LEN)
 			priv->lof = lof[MXL_MOCA_LOF_OFF_LOF / 4];
 
-		mxl371x_read_phy_rates(phydev);
-		mxl371x_read_node_info(phydev);
+		/*
+		 * Each rate read is a query per node, so keep them off the coax
+		 * unless the network changed; readers ask for fresh ones.
+		 */
+		if (!was_up || priv->active_nodes != old_active ||
+		    time_after(jiffies, priv->rates_stamp + MXL_MOCA_RATES_MAX_AGE))
+			mxl371x_refresh_rates(phydev, true);
 	} else {
 		priv->phy_rate = 0;
 		memset(priv->phy_rate_tx, 0, sizeof(priv->phy_rate_tx));
@@ -875,13 +922,15 @@ static int mxl371x_read_moca_status(struct phy_device *phydev)
 
 /*
  * Poll SoC health (GET_SOC_STATUS): word0 == 1 is healthy, word1 is the fatal
- * code.  Mirrors the OEM daemon -- after a few consecutive unhealthy reads the
- * firmware has genuinely faulted (e.g. a runtime cal/IQ error) and would stay
- * dead, so re-initialise the SoC to recover.  A short mailbox hiccup is not
- * counted (we only act on a clear status != 1).
+ * code.  After a few unhealthy reads in a row the firmware has genuinely
+ * faulted (e.g. a runtime cal/IQ error) and would stay dead; a mailbox that
+ * stops answering altogether is the same fault.  Returns true when the SoC
+ * needs a re-init, which the caller must not run from this work: mxl371x_reinit
+ * waits for it.
  */
 #define MXL_MOCA_SOC_FAIL_LIMIT		3
-static void mxl371x_check_soc_health(struct phy_device *phydev)
+#define MXL_MOCA_RECOVER_RETRY		(60 * HZ)
+static bool mxl371x_check_soc_health(struct phy_device *phydev)
 {
 	struct mxl371x_priv *priv = phydev->priv;
 	u32 rsp[MXL_MOCA_SOC_STATUS_RSP_LEN / 4];
@@ -890,13 +939,20 @@ static void mxl371x_check_soc_health(struct phy_device *phydev)
 	ret = mxl371x_mbox_cmd(phydev, MXL_MOCA_CMD_GET_SOC_STATUS & 0xffff,
 			       NULL, 0, rsp, ARRAY_SIZE(rsp),
 			       MXL371X_MBOX_POLL_STATUS);
-	if (ret < MXL_MOCA_SOC_STATUS_RSP_LEN)
-		return;		/* transient -- don't penalise a flaky read */
+	if (ret < MXL_MOCA_SOC_STATUS_RSP_LEN) {
+		if (++priv->mbox_fail_count < MXL_MOCA_SOC_FAIL_LIMIT)
+			return false;	/* may be a flaky read */
+		dev_err(&phydev->mdio.dev,
+			"MoCA mailbox not answering (%d); re-initialising\n", ret);
+		priv->mbox_fail_count = 0;
+		return true;
+	}
+	priv->mbox_fail_count = 0;
 
 	priv->soc_healthy = (rsp[MXL_MOCA_SOC_STATUS_OFF_STATUS / 4] == 1);
 	if (priv->soc_healthy) {
 		priv->soc_fail_count = 0;
-		return;
+		return false;
 	}
 
 	if (++priv->soc_fail_count < MXL_MOCA_SOC_FAIL_LIMIT) {
@@ -905,14 +961,24 @@ static void mxl371x_check_soc_health(struct phy_device *phydev)
 			 rsp[MXL_MOCA_SOC_STATUS_OFF_STATUS / 4],
 			 rsp[MXL_MOCA_SOC_STATUS_OFF_FATAL / 4],
 			 priv->soc_fail_count, MXL_MOCA_SOC_FAIL_LIMIT);
-		return;
+		return false;
 	}
 
 	dev_err(&phydev->mdio.dev,
 		"MoCA SoC fault persisted (fatal=0x%x); re-initialising\n",
 		rsp[MXL_MOCA_SOC_STATUS_OFF_FATAL / 4]);
 	priv->soc_fail_count = 0;
-	mxl371x_reinit(phydev);
+	return true;
+}
+
+static void mxl371x_recover_work(struct work_struct *work)
+{
+	struct mxl371x_priv *priv = container_of(work, struct mxl371x_priv,
+						 recover_work.work);
+
+	if (mxl371x_reinit(priv->phydev) < 0)
+		schedule_delayed_work(&priv->recover_work,
+				      MXL_MOCA_RECOVER_RETRY);
 }
 
 static void mxl371x_stats_poll_work(struct work_struct *work)
@@ -930,12 +996,15 @@ static void mxl371x_stats_poll_work(struct work_struct *work)
 	 */
 	if (priv->mbox_ready) {
 		if (mxl371x_read_moca_status(phydev) < 0)
-			delay = 30 * HZ;
+			delay = 5 * HZ;
 		else if (phydev->attached_dev)
 			mxl371x_update_stats(phydev);
 
-		/* Watchdog the SoC and recover it on a persistent fault. */
-		mxl371x_check_soc_health(phydev);
+		/* Watchdog the SoC; the re-init restarts this poll. */
+		if (mxl371x_check_soc_health(phydev)) {
+			schedule_delayed_work(&priv->recover_work, 0);
+			return;
+		}
 	}
 
 	/* DIAG: track the host-interface mode register; log only when it
@@ -1146,6 +1215,7 @@ static ssize_t moca_phy_rate_show(struct device *dev,
 	struct phy_device *phydev = to_phy_device(dev);
 	struct mxl371x_priv *priv = phydev->priv;
 
+	mxl371x_refresh_rates(to_phy_device(dev), false);
 	return sprintf(buf, "%u\n", priv->phy_rate);
 }
 static DEVICE_ATTR_RO(moca_phy_rate);
@@ -1158,6 +1228,7 @@ static ssize_t moca_phy_rates_show(struct device *dev,
 	struct mxl371x_priv *priv = phydev->priv;
 	int n, len = 0;
 
+	mxl371x_refresh_rates(phydev, false);
 	for (n = 0; n < MXL_MOCA_MAX_NODES; n++) {
 		if (n == priv->node_id || !(priv->active_nodes & BIT(n)))
 			continue;
@@ -1182,6 +1253,7 @@ static ssize_t moca_nodes_show(struct device *dev,
 	struct mxl371x_priv *priv = to_phy_device(dev)->priv;
 	int n, len = 0;
 
+	mxl371x_refresh_rates(to_phy_device(dev), false);
 	for (n = 0; n < MXL_MOCA_MAX_NODES; n++) {
 		const char *role;
 		u8 ver;
@@ -1225,7 +1297,7 @@ static ssize_t moca_nodes_show(struct device *dev,
 static DEVICE_ATTR_RO(moca_nodes);
 
 /*
- * Reset remote MoCA node(s) over L2ME -- the OEM "clnkrst -m <nodemask>" path,
+ * Reset remote MoCA node(s) over L2ME,
  * and the vendor-agnostic way to manage other adapters on the coax that expose
  * no IP.  Write "<nodemask> [seconds]" (nodemask hex or decimal, one bit per
  * node id; optional delay).  Our own node bit is always cleared so we never
@@ -1277,9 +1349,10 @@ static DEVICE_ATTR_WO(moca_node_reset);
 /*
  * Generic L2ME/MoCA command passthrough.  Write "<cmdid> [w0 w1 ...]" (all hex
  * 32-bit words; first word is the command id, the rest are the request payload)
- * to issue any SoC/DCAP command; read back "<resp_bytes> <w0> <w1> ..." with the
- * response words.  This is the full getter/setter surface the OEM clink stack
- * uses -- root only (the attribute is 0600 via DEVICE_ATTR_RW + the group).
+ * to issue a SoC command; read back "<resp_bytes> <w0> <w1> ..." with the
+ * response words.  Requests are limited to MXL_MOCA_CMD_REQ_WORDS, which leaves
+ * out the few commands with longer payloads -- root only (the attribute is 0600
+ * via DEVICE_ATTR_RW + the group).
  */
 static ssize_t moca_cmd_store(struct device *dev, struct device_attribute *attr,
 			      const char *buf, size_t count)
@@ -1951,6 +2024,10 @@ MOCA_CFG_BITS_FIELD(retx_priority, 0x01c, 4, 4);
 MOCA_CFG_BITS_FIELD(tx_priority_per, 0x020, 4, 4);
 MOCA_CFG_BITS_FIELD(tpc_mode, 0x254, 2, 2);
 MOCA_CFG_NUM_FIELD(tpc_rate_50, 0x256, 2, 0xffff);
+MOCA_CFG_NUM_FIELD(mps_privacy_down, 0x2c6, 2, 1);
+MOCA_CFG_NUM_FIELD(mps_privacy_receive, 0x2c8, 2, 1);
+MOCA_CFG_NUM_FIELD(mps_unpaired_time, 0x2cc, 4, 0xffffffff);
+MOCA_CFG_NUM_FIELD(mps_walk_time, 0x2d0, 4, 0xffffffff);
 MOCA_CFG_NUM_FIELD(tpc_rate_nper, 0x258, 2, 0xffff);
 MOCA_CFG_NUM_FIELD(tpc_rate_vlper, 0x25a, 2, 0xffff);
 MOCA_CFG_NUM_FIELD(lmo_mode, 0x026, 1, 0xff);
@@ -2182,8 +2259,9 @@ static ssize_t moca_cfg_sapm_profile_show(struct device *dev,
 static DEVICE_ATTR_RW(moca_cfg_sapm_profile);
 
 /*
- * Frames the SoC received from the coax and discarded instead of sending out of
- * its Ethernet side; a steady climb under load means too little PHY margin.
+ * Frames the SoC dropped on its Ethernet side, on the way to the host.  It says
+ * where they went missing, not why: coax errors and a burst too large for the
+ * host link both end here.
  */
 #define MXL_MOCA_CMD_GET_EPHY_STATS	0x1010013
 #define MXL_EPHY_STATS_WORDS		14
@@ -2203,9 +2281,136 @@ static ssize_t moca_frame_drops_show(struct device *dev,
 		return ret;
 	if (ret < sizeof(rsp))
 		return -EIO;
-	return sysfs_emit(buf, "%u\n", rsp[MXL_EPHY_STATS_DROPS]);
+	return sysfs_emit(buf, "%llu\n", (u64)rsp[MXL_EPHY_STATS_DROPS + 1] << 32 |
+			  rsp[MXL_EPHY_STATS_DROPS]);
 }
 static DEVICE_ATTR_RO(moca_frame_drops);
+
+static ssize_t moca_admission_status_show(struct device *dev,
+		struct device_attribute *attr, char *buf)
+{
+	struct mxl371x_priv *priv = to_phy_device(dev)->priv;
+
+	return sysfs_emit(buf, "%u\n", priv->adm_status);
+}
+static DEVICE_ATTR_RO(moca_admission_status);
+
+static ssize_t moca_link_resets_show(struct device *dev,
+		struct device_attribute *attr, char *buf)
+{
+	struct mxl371x_priv *priv = to_phy_device(dev)->priv;
+
+	return sysfs_emit(buf, "%u\n", priv->link_resets);
+}
+static DEVICE_ATTR_RO(moca_link_resets);
+
+/*
+ * MoCA Protected Setup, the coax push button.  A trigger starts a session that
+ * pairs with whichever node was triggered within the walk time; the report then
+ * says how it ended and, when the password moved, carries the new one.
+ */
+#define MXL_MOCA_CMD_MPS_TRIGGER	0x1010090
+#define MXL_MOCA_CMD_MPS_REPORT		0x1010091
+#define MXL_MOCA_CMD_MPS_STATE		0x1010092
+#define MXL_MPS_REPORT_LEN		132
+#define MXL_MPS_OFF_VALID		0x04
+#define MXL_MPS_OFF_PAIRED		0x05
+#define MXL_MPS_OFF_PRIV_CHANGED	0x06
+#define MXL_MPS_OFF_PB_NODE		0x07
+#define MXL_MPS_OFF_NAME		0x08
+#define MXL_MPS_NAME_LEN		32
+#define MXL_MPS_OFF_PRIV_ENABLED	0x2d
+#define MXL_MPS_OFF_PASSWORD		0x30
+#define MXL_MPS_PASSWORD_LEN		20
+#define MXL_MPS_OFF_EPASSWORD		0x44
+#define MXL_MPS_EPASSWORD_LEN		64
+
+static ssize_t moca_mps_trigger_store(struct device *dev,
+		struct device_attribute *attr, const char *buf, size_t count)
+{
+	struct phy_device *phydev = to_phy_device(dev);
+	u32 rsp;
+	int ret;
+
+	ret = mxl371x_mbox_cmd(phydev, MXL_MOCA_CMD_MPS_TRIGGER & 0xffff,
+			       NULL, 0, &rsp, 1, MXL371X_MBOX_POLL_BOOT);
+	if (ret < 0)
+		return ret;
+	if (ret < sizeof(rsp))
+		return -EIO;
+	return rsp ? -EAGAIN : count;
+}
+static DEVICE_ATTR_WO(moca_mps_trigger);
+
+static ssize_t moca_mps_state_show(struct device *dev,
+		struct device_attribute *attr, char *buf)
+{
+	u32 rsp;
+	int ret;
+
+	ret = mxl371x_mbox_cmd(to_phy_device(dev),
+			       MXL_MOCA_CMD_MPS_STATE & 0xffff, NULL, 0, &rsp, 1,
+			       MXL371X_MBOX_POLL_BOOT);
+	if (ret < 0)
+		return ret;
+	if (ret < sizeof(rsp))
+		return -EIO;
+	return sysfs_emit(buf, "%s\n", rsp ? "paired" : "unpaired");
+}
+static DEVICE_ATTR_RO(moca_mps_state);
+
+/* Word 0 is a number; the rest is bytes, big-endian within each word. */
+static int mxl371x_mps_report(struct phy_device *phydev, u32 *type, u8 *b)
+{
+	u32 rsp[MXL_MPS_REPORT_LEN / 4];
+	int ret, i;
+
+	ret = mxl371x_mbox_cmd(phydev, MXL_MOCA_CMD_MPS_REPORT & 0xffff,
+			       NULL, 0, rsp, ARRAY_SIZE(rsp),
+			       MXL371X_MBOX_POLL_BOOT);
+	if (ret < 0)
+		return ret;
+	if (ret < sizeof(rsp))
+		return -EIO;
+	*type = rsp[0];
+	for (i = 0; i < ARRAY_SIZE(rsp); i++)
+		put_unaligned_be32(rsp[i], b + i * 4);
+	return 0;
+}
+
+static ssize_t moca_mps_report_show(struct device *dev,
+		struct device_attribute *attr, char *buf)
+{
+	u8 b[MXL_MPS_REPORT_LEN];
+	u32 type;
+	int ret;
+
+	ret = mxl371x_mps_report(to_phy_device(dev), &type, b);
+	if (ret)
+		return ret;
+	return sysfs_emit(buf, "type=0x%x valid=%u paired=%u privacy_changed=%u node=%u name=%.*s\n",
+			  type, b[MXL_MPS_OFF_VALID], b[MXL_MPS_OFF_PAIRED],
+			  b[MXL_MPS_OFF_PRIV_CHANGED], b[MXL_MPS_OFF_PB_NODE],
+			  MXL_MPS_NAME_LEN, b + MXL_MPS_OFF_NAME);
+}
+static DEVICE_ATTR_RO(moca_mps_report);
+
+static ssize_t moca_mps_privacy_show(struct device *dev,
+		struct device_attribute *attr, char *buf)
+{
+	u8 b[MXL_MPS_REPORT_LEN];
+	u32 type;
+	int ret;
+
+	ret = mxl371x_mps_report(to_phy_device(dev), &type, b);
+	if (ret)
+		return ret;
+	return sysfs_emit(buf, "enabled=%u\npassword=%.*s\nenhanced_password=%.*s\n",
+			  b[MXL_MPS_OFF_PRIV_ENABLED],
+			  MXL_MPS_PASSWORD_LEN, b + MXL_MPS_OFF_PASSWORD,
+			  MXL_MPS_EPASSWORD_LEN, b + MXL_MPS_OFF_EPASSWORD);
+}
+static DEVICE_ATTR_ADMIN_RO(moca_mps_privacy);
 
 /*
  * Apply all staged moca_cfg_* changes.  Writing here re-initialises the MoCA
@@ -2240,6 +2445,12 @@ static struct attribute *mxl371x_attrs[] = {
 	&dev_attr_moca_fw_version.attr,
 	&dev_attr_moca_guid.attr,
 	&dev_attr_moca_frame_drops.attr,
+	&dev_attr_moca_admission_status.attr,
+	&dev_attr_moca_link_resets.attr,
+	&dev_attr_moca_mps_trigger.attr,
+	&dev_attr_moca_mps_state.attr,
+	&dev_attr_moca_mps_report.attr,
+	&dev_attr_moca_mps_privacy.attr,
 	/* editable boot config (re-admits on write) */
 	&dev_attr_moca_cfg_lof.attr,
 	&dev_attr_moca_cfg_preferred_nc.attr,
@@ -2264,6 +2475,10 @@ static struct attribute *mxl371x_attrs[] = {
 	&moca_cfg_f_tx_priority_per.attr.attr,
 	&moca_cfg_f_tpc_mode.attr.attr,
 	&moca_cfg_f_tpc_rate_50.attr.attr,
+	&moca_cfg_f_mps_privacy_down.attr.attr,
+	&moca_cfg_f_mps_privacy_receive.attr.attr,
+	&moca_cfg_f_mps_unpaired_time.attr.attr,
+	&moca_cfg_f_mps_walk_time.attr.attr,
 	&moca_cfg_f_tpc_rate_nper.attr.attr,
 	&moca_cfg_f_tpc_rate_vlper.attr.attr,
 	&moca_cfg_f_lmo_mode.attr.attr,
@@ -3181,6 +3396,8 @@ static int mxl371x_probe(struct phy_device *phydev)
 	mutex_init(&priv->apply_lock);
 	mutex_init(&priv->cmd_lock);
 	INIT_DELAYED_WORK(&priv->stats_poll, mxl371x_stats_poll_work);
+	INIT_DELAYED_WORK(&priv->recover_work, mxl371x_recover_work);
+	mutex_init(&priv->rates_lock);
 	return 0;
 }
 
@@ -3188,6 +3405,7 @@ static void mxl371x_remove(struct phy_device *phydev)
 {
 	struct mxl371x_priv *priv = phydev->priv;
 
+	cancel_delayed_work_sync(&priv->recover_work);
 	cancel_delayed_work_sync(&priv->stats_poll);
 	sysfs_remove_group(&phydev->mdio.dev.kobj, &mxl371x_attr_group);
 }
@@ -3235,6 +3453,7 @@ static int mxl371x_suspend(struct phy_device *phydev)
 {
 	struct mxl371x_priv *priv = phydev->priv;
 
+	cancel_delayed_work_sync(&priv->recover_work);
 	cancel_delayed_work_sync(&priv->stats_poll);
 	return genphy_suspend(phydev);
 }
