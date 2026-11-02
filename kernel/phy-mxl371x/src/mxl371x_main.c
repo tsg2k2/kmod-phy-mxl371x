@@ -1820,6 +1820,394 @@ static ssize_t moca_cfg_network_name_store(struct device *dev,
 static DEVICE_ATTR_RW(moca_cfg_network_name);
 
 /*
+ * Coax tuning fields of clink.bin.  Band-indexed ones hold one value per band
+ * (D, D-low, D-high, E, F-sat, F-cable, H, custom); a write sets every band
+ * and a read reports band D.
+ */
+enum moca_cfg_kind {
+	MOCA_CFG_NUM,		/* one little-endian value */
+	MOCA_CFG_BAND_BYTES,	/* one byte per band */
+	MOCA_CFG_BAND_BITS,	/* @width bits per band, little-endian */
+};
+
+struct moca_cfg_field {
+	struct device_attribute attr;
+	u16 off;
+	u8 bytes;		/* NUM/BAND_BITS: size of the whole field */
+	u8 width;		/* BAND_BITS: bits per band */
+	u32 max;
+	enum moca_cfg_kind kind;
+};
+
+#define MXL_CLINK_BANDS		8
+
+static u32 moca_cfg_get_le(const u8 *p, u8 bytes)
+{
+	u32 v = 0;
+
+	while (bytes--)
+		v = (v << 8) | p[bytes];
+	return v;
+}
+
+static void moca_cfg_put_le(u8 *p, u8 bytes, u32 v)
+{
+	while (bytes--) {
+		*p++ = v;
+		v >>= 8;
+	}
+}
+
+static ssize_t moca_cfg_field_show(struct device *dev,
+		struct device_attribute *attr, char *buf)
+{
+	const struct moca_cfg_field *f =
+		container_of(attr, struct moca_cfg_field, attr);
+	struct mxl371x_priv *priv = to_phy_device(dev)->priv;
+	u32 v;
+
+	mutex_lock(&priv->cfg_lock);
+	if (!priv->cfg_ready) {
+		mutex_unlock(&priv->cfg_lock);
+		return -ENODEV;
+	}
+	switch (f->kind) {
+	case MOCA_CFG_NUM:
+		v = moca_cfg_get_le(priv->clink_cfg + f->off, f->bytes);
+		break;
+	case MOCA_CFG_BAND_BYTES:
+		v = priv->clink_cfg[f->off];
+		break;
+	default:
+		v = moca_cfg_get_le(priv->clink_cfg + f->off, f->bytes) &
+		    GENMASK(f->width - 1, 0);
+		break;
+	}
+	mutex_unlock(&priv->cfg_lock);
+	return sysfs_emit(buf, "%u\n", v);
+}
+
+static ssize_t moca_cfg_field_store(struct device *dev,
+		struct device_attribute *attr, const char *buf, size_t count)
+{
+	const struct moca_cfg_field *f =
+		container_of(attr, struct moca_cfg_field, attr);
+	struct mxl371x_priv *priv = to_phy_device(dev)->priv;
+	u32 val, all = 0;
+	int i;
+
+	if (kstrtou32(buf, 0, &val) || val > f->max)
+		return -EINVAL;
+
+	mutex_lock(&priv->cfg_lock);
+	if (!priv->cfg_ready) {
+		mutex_unlock(&priv->cfg_lock);
+		return -ENODEV;
+	}
+	switch (f->kind) {
+	case MOCA_CFG_NUM:
+		moca_cfg_put_le(priv->clink_cfg + f->off, f->bytes, val);
+		break;
+	case MOCA_CFG_BAND_BYTES:
+		memset(priv->clink_cfg + f->off, val, MXL_CLINK_BANDS);
+		break;
+	default:
+		for (i = 0; i < MXL_CLINK_BANDS; i++)
+			all |= val << (i * f->width);
+		moca_cfg_put_le(priv->clink_cfg + f->off, f->bytes, all);
+		break;
+	}
+	mutex_unlock(&priv->cfg_lock);
+	return count;
+}
+
+#define MOCA_CFG_FIELD(_name, _kind, _off, _bytes, _width, _max)	      \
+static struct moca_cfg_field moca_cfg_f_##_name = {			      \
+	.attr	= __ATTR(moca_cfg_##_name, 0644, moca_cfg_field_show,	      \
+			 moca_cfg_field_store),				      \
+	.off	= (_off),						      \
+	.bytes	= (_bytes),						      \
+	.width	= (_width),						      \
+	.max	= (_max),						      \
+	.kind	= (_kind),						      \
+}
+#define MOCA_CFG_NUM_FIELD(_name, _off, _bytes, _max)			      \
+	MOCA_CFG_FIELD(_name, MOCA_CFG_NUM, _off, _bytes, 0, _max)
+#define MOCA_CFG_BYTES_FIELD(_name, _off, _max)				      \
+	MOCA_CFG_FIELD(_name, MOCA_CFG_BAND_BYTES, _off, 0, 0, _max)
+#define MOCA_CFG_BITS_FIELD(_name, _off, _bytes, _width)		      \
+	MOCA_CFG_FIELD(_name, MOCA_CFG_BAND_BITS, _off, _bytes, _width,	      \
+		       BIT(_width) - 1)
+
+MOCA_CFG_BYTES_FIELD(phy_margin, 0x23c, 255);
+MOCA_CFG_BYTES_FIELD(phy_margin_nper, 0x244, 255);
+MOCA_CFG_BYTES_FIELD(phy_margin_vlper, 0x24c, 255);
+MOCA_CFG_BYTES_FIELD(tlp_min, 0x21c, 255);
+MOCA_CFG_BYTES_FIELD(tlp_max, 0x224, 255);
+MOCA_CFG_BYTES_FIELD(num_channels, 0x270, 5);
+MOCA_CFG_BITS_FIELD(turbo_mode, 0x002, 1, 1);
+MOCA_CFG_BITS_FIELD(policing_mode, 0x016, 1, 1);
+MOCA_CFG_BITS_FIELD(retx_priority, 0x01c, 4, 4);
+MOCA_CFG_BITS_FIELD(tx_priority_per, 0x020, 4, 4);
+MOCA_CFG_BITS_FIELD(tpc_mode, 0x254, 2, 2);
+MOCA_CFG_NUM_FIELD(tpc_rate_50, 0x256, 2, 0xffff);
+MOCA_CFG_NUM_FIELD(tpc_rate_nper, 0x258, 2, 0xffff);
+MOCA_CFG_NUM_FIELD(tpc_rate_vlper, 0x25a, 2, 0xffff);
+MOCA_CFG_NUM_FIELD(lmo_mode, 0x026, 1, 0xff);
+MOCA_CFG_NUM_FIELD(mii_pause_pri, 0x014, 2, 0xffff);
+MOCA_CFG_NUM_FIELD(strip_vlan_tag, 0x25c, 4, 0xffff);
+
+/*
+ * RLAPM adds PHY margin by receive level, SAPM by subcarrier.  Byte 0 of each
+ * blob is the mask of bands they run on (bit 0 = band D, order as above); the
+ * profiles after it are picked by frequency.
+ */
+#define MXL_RLAPM_SLOTS		6
+#define MXL_RLAPM_STRIDE	0x58
+#define MXL_RLAPM_LEVELS	0x54
+#define MXL_SAPM_SLOTS		4
+#define MXL_SAPM_STRIDE		0x10c
+#define MXL_SAPM_CARRIERS	0x100
+
+static ssize_t moca_cfg_mask_show(struct device *dev, const u8 *mask, char *buf)
+{
+	struct mxl371x_priv *priv = to_phy_device(dev)->priv;
+
+	return priv->cfg_ready ? sysfs_emit(buf, "%u\n", *mask) : -ENODEV;
+}
+
+static ssize_t moca_cfg_mask_store(struct device *dev, u8 *mask,
+				   const char *buf, size_t count)
+{
+	struct mxl371x_priv *priv = to_phy_device(dev)->priv;
+	u8 val;
+
+	if (kstrtou8(buf, 0, &val))
+		return -EINVAL;
+	mutex_lock(&priv->cfg_lock);
+	if (!priv->cfg_ready) {
+		mutex_unlock(&priv->cfg_lock);
+		return -ENODEV;
+	}
+	*mask = val;
+	mutex_unlock(&priv->cfg_lock);
+	return count;
+}
+
+static ssize_t moca_cfg_rlapm_band_mask_show(struct device *dev,
+		struct device_attribute *attr, char *buf)
+{
+	struct mxl371x_priv *priv = to_phy_device(dev)->priv;
+
+	return moca_cfg_mask_show(dev, priv->cfg_blobs.rlapm.data, buf);
+}
+
+static ssize_t moca_cfg_rlapm_band_mask_store(struct device *dev,
+		struct device_attribute *attr, const char *buf, size_t count)
+{
+	struct mxl371x_priv *priv = to_phy_device(dev)->priv;
+
+	return moca_cfg_mask_store(dev, (u8 *)priv->cfg_blobs.rlapm.data, buf,
+				   count);
+}
+static DEVICE_ATTR_RW(moca_cfg_rlapm_band_mask);
+
+static ssize_t moca_cfg_sapm_band_mask_show(struct device *dev,
+		struct device_attribute *attr, char *buf)
+{
+	struct mxl371x_priv *priv = to_phy_device(dev)->priv;
+
+	return moca_cfg_mask_show(dev, priv->cfg_blobs.sapm.data, buf);
+}
+
+static ssize_t moca_cfg_sapm_band_mask_store(struct device *dev,
+		struct device_attribute *attr, const char *buf, size_t count)
+{
+	struct mxl371x_priv *priv = to_phy_device(dev)->priv;
+
+	return moca_cfg_mask_store(dev, (u8 *)priv->cfg_blobs.sapm.data, buf,
+				   count);
+}
+static DEVICE_ATTR_RW(moca_cfg_sapm_band_mask);
+
+/* parse "<index>:<margin> ..." into a zeroed table; returns 0 or -EINVAL */
+static int moca_cfg_parse_table(const char *p, u8 *tbl, unsigned int size)
+{
+	unsigned int idx, margin;
+	int n;
+
+	memset(tbl, 0, size);
+	while (sscanf(p, " %u:%u%n", &idx, &margin, &n) == 2) {
+		if (idx >= size || margin > 255)
+			return -EINVAL;
+		tbl[idx] = margin;
+		p += n;
+	}
+	return strim((char *)p)[0] ? -EINVAL : 0;
+}
+
+static int moca_cfg_show_table(char *buf, int len, const u8 *tbl,
+			       unsigned int size)
+{
+	unsigned int i;
+
+	for (i = 0; i < size; i++)
+		if (tbl[i])
+			len += sysfs_emit_at(buf, len, " %u:%u", i, tbl[i]);
+	return len + sysfs_emit_at(buf, len, "\n");
+}
+
+/* "<slot> <freq MHz> <rx level>:<margin> ..." (freq 0 clears the slot) */
+static ssize_t moca_cfg_rlapm_profile_store(struct device *dev,
+		struct device_attribute *attr, const char *buf, size_t count)
+{
+	struct mxl371x_priv *priv = to_phy_device(dev)->priv;
+	u8 tbl[MXL_RLAPM_LEVELS], *e;
+	unsigned int slot, freq;
+	char *s;
+	int n, ret;
+
+	if (sscanf(buf, "%u %u%n", &slot, &freq, &n) != 2 ||
+	    slot >= MXL_RLAPM_SLOTS || freq > 0xffff)
+		return -EINVAL;
+	s = kstrdup(buf + n, GFP_KERNEL);
+	if (!s)
+		return -ENOMEM;
+	ret = moca_cfg_parse_table(s, tbl, sizeof(tbl));
+	kfree(s);
+	if (ret)
+		return ret;
+
+	mutex_lock(&priv->cfg_lock);
+	if (!priv->cfg_ready) {
+		mutex_unlock(&priv->cfg_lock);
+		return -ENODEV;
+	}
+	e = (u8 *)priv->cfg_blobs.rlapm.data + 4 + slot * MXL_RLAPM_STRIDE;
+	moca_cfg_put_le(e, 2, freq);
+	memcpy(e + 4, tbl, sizeof(tbl));
+	mutex_unlock(&priv->cfg_lock);
+	return count;
+}
+
+static ssize_t moca_cfg_rlapm_profile_show(struct device *dev,
+		struct device_attribute *attr, char *buf)
+{
+	struct mxl371x_priv *priv = to_phy_device(dev)->priv;
+	const u8 *e;
+	int i, len = 0;
+
+	mutex_lock(&priv->cfg_lock);
+	if (!priv->cfg_ready) {
+		mutex_unlock(&priv->cfg_lock);
+		return -ENODEV;
+	}
+	for (i = 0; i < MXL_RLAPM_SLOTS; i++) {
+		e = priv->cfg_blobs.rlapm.data + 4 + i * MXL_RLAPM_STRIDE;
+		if (!e[0] && !e[1])
+			continue;
+		len += sysfs_emit_at(buf, len, "%d %u", i,
+				     moca_cfg_get_le(e, 2));
+		len = moca_cfg_show_table(buf, len, e + 4, MXL_RLAPM_LEVELS);
+	}
+	mutex_unlock(&priv->cfg_lock);
+	return len;
+}
+static DEVICE_ATTR_RW(moca_cfg_rlapm_profile);
+
+/* "<slot> <freq MHz> <threshold> <scstart> <offset>:<margin> ..." */
+static ssize_t moca_cfg_sapm_profile_store(struct device *dev,
+		struct device_attribute *attr, const char *buf, size_t count)
+{
+	struct mxl371x_priv *priv = to_phy_device(dev)->priv;
+	unsigned int slot, freq, thresh;
+	int scstart, n, ret;
+	u8 *tbl, *e;
+	char *s;
+
+	if (sscanf(buf, "%u %u %u %d%n", &slot, &freq, &thresh, &scstart,
+		   &n) != 4 || slot >= MXL_SAPM_SLOTS || freq > 0xffff ||
+	    thresh > 255 || scstart < -255 || scstart > 255)
+		return -EINVAL;
+	tbl = kmalloc(MXL_SAPM_CARRIERS, GFP_KERNEL);
+	s = kstrdup(buf + n, GFP_KERNEL);
+	ret = tbl && s ? moca_cfg_parse_table(s, tbl, MXL_SAPM_CARRIERS) :
+			 -ENOMEM;
+	kfree(s);
+	if (ret)
+		goto out;
+
+	mutex_lock(&priv->cfg_lock);
+	if (!priv->cfg_ready) {
+		mutex_unlock(&priv->cfg_lock);
+		ret = -ENODEV;
+		goto out;
+	}
+	e = (u8 *)priv->cfg_blobs.sapm.data + 4 + slot * MXL_SAPM_STRIDE;
+	moca_cfg_put_le(e, 2, freq);
+	e[4] = thresh;
+	moca_cfg_put_le(e + 8, 2, (u16)scstart);
+	memcpy(e + 0xc, tbl, MXL_SAPM_CARRIERS);
+	mutex_unlock(&priv->cfg_lock);
+out:
+	kfree(tbl);
+	return ret ? ret : count;
+}
+
+static ssize_t moca_cfg_sapm_profile_show(struct device *dev,
+		struct device_attribute *attr, char *buf)
+{
+	struct mxl371x_priv *priv = to_phy_device(dev)->priv;
+	const u8 *e;
+	int i, len = 0;
+
+	mutex_lock(&priv->cfg_lock);
+	if (!priv->cfg_ready) {
+		mutex_unlock(&priv->cfg_lock);
+		return -ENODEV;
+	}
+	for (i = 0; i < MXL_SAPM_SLOTS; i++) {
+		e = priv->cfg_blobs.sapm.data + 4 + i * MXL_SAPM_STRIDE;
+		if (!e[0] && !e[1])
+			continue;
+		len += sysfs_emit_at(buf, len, "%d %u %u %d", i,
+				     moca_cfg_get_le(e, 2), e[4],
+				     (s16)moca_cfg_get_le(e + 8, 2));
+		len = moca_cfg_show_table(buf, len, e + 0xc,
+					  MXL_SAPM_CARRIERS);
+	}
+	mutex_unlock(&priv->cfg_lock);
+	return len;
+}
+static DEVICE_ATTR_RW(moca_cfg_sapm_profile);
+
+/*
+ * Frames the SoC received from the coax and discarded instead of sending out of
+ * its Ethernet side; a steady climb under load means too little PHY margin.
+ */
+#define MXL_MOCA_CMD_GET_EPHY_STATS	0x1010013
+#define MXL_EPHY_STATS_WORDS		14
+#define MXL_EPHY_STATS_DROPS		10
+
+static ssize_t moca_frame_drops_show(struct device *dev,
+		struct device_attribute *attr, char *buf)
+{
+	struct phy_device *phydev = to_phy_device(dev);
+	u32 rsp[MXL_EPHY_STATS_WORDS], req = 0;
+	int ret;
+
+	ret = mxl371x_mbox_cmd(phydev, MXL_MOCA_CMD_GET_EPHY_STATS & 0xffff,
+			       &req, sizeof(req), rsp, ARRAY_SIZE(rsp),
+			       MXL371X_MBOX_POLL_BOOT);
+	if (ret < 0)
+		return ret;
+	if (ret < sizeof(rsp))
+		return -EIO;
+	return sysfs_emit(buf, "%u\n", rsp[MXL_EPHY_STATS_DROPS]);
+}
+static DEVICE_ATTR_RO(moca_frame_drops);
+
+/*
  * Apply all staged moca_cfg_* changes.  Writing here re-initialises the MoCA
  * SoC with the edited config (the "save" step); the coax link drops for a few
  * seconds while the firmware reloads and the node re-admits.
@@ -1851,6 +2239,7 @@ static struct attribute *mxl371x_attrs[] = {
 	&dev_attr_moca_chip_type.attr,
 	&dev_attr_moca_fw_version.attr,
 	&dev_attr_moca_guid.attr,
+	&dev_attr_moca_frame_drops.attr,
 	/* editable boot config (re-admits on write) */
 	&dev_attr_moca_cfg_lof.attr,
 	&dev_attr_moca_cfg_preferred_nc.attr,
@@ -1863,6 +2252,27 @@ static struct attribute *mxl371x_attrs[] = {
 	&dev_attr_moca_cfg_enhanced_password.attr,
 	&dev_attr_moca_cfg_enhanced_privacy_mode.attr,
 	&dev_attr_moca_cfg_network_name.attr,
+	&moca_cfg_f_phy_margin.attr.attr,
+	&moca_cfg_f_phy_margin_nper.attr.attr,
+	&moca_cfg_f_phy_margin_vlper.attr.attr,
+	&moca_cfg_f_tlp_min.attr.attr,
+	&moca_cfg_f_tlp_max.attr.attr,
+	&moca_cfg_f_num_channels.attr.attr,
+	&moca_cfg_f_turbo_mode.attr.attr,
+	&moca_cfg_f_policing_mode.attr.attr,
+	&moca_cfg_f_retx_priority.attr.attr,
+	&moca_cfg_f_tx_priority_per.attr.attr,
+	&moca_cfg_f_tpc_mode.attr.attr,
+	&moca_cfg_f_tpc_rate_50.attr.attr,
+	&moca_cfg_f_tpc_rate_nper.attr.attr,
+	&moca_cfg_f_tpc_rate_vlper.attr.attr,
+	&moca_cfg_f_lmo_mode.attr.attr,
+	&moca_cfg_f_mii_pause_pri.attr.attr,
+	&moca_cfg_f_strip_vlan_tag.attr.attr,
+	&dev_attr_moca_cfg_rlapm_band_mask.attr,
+	&dev_attr_moca_cfg_sapm_band_mask.attr,
+	&dev_attr_moca_cfg_rlapm_profile.attr,
+	&dev_attr_moca_cfg_sapm_profile.attr,
 	&dev_attr_moca_cfg_apply.attr,
 	NULL,
 };
