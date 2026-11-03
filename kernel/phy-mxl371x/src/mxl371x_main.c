@@ -13,6 +13,7 @@
 #include <linux/delay.h>
 #include <linux/of.h>
 #include <linux/of_net.h>
+#include <linux/nvmem-consumer.h>
 #include <linux/netdevice.h>
 #include <linux/etherdevice.h>
 #include <linux/ethtool.h>
@@ -1143,10 +1144,45 @@ static int mxl371x_check_firmware_running(struct phy_device *phydev)
 	return 0;
 }
 
+/* The board keeps its base MAC as ASCII in the bootloader environment. */
+#define MXL_MOCA_BASE_MAC_LEN		17
+#define MXL_MOCA_BASE_MAC_OFFSET	5
+
+/* Read the MoCA MAC of the board from the "base-mac" nvmem cell, if it has one. */
+static int mxl371x_board_mac(struct device *dev, u8 *mac)
+{
+	char str[MXL_MOCA_BASE_MAC_LEN + 1];
+	struct nvmem_cell *cell;
+	size_t len;
+	void *val;
+	int ret = -EINVAL;
+
+	cell = of_nvmem_cell_get(dev->of_node, "base-mac");
+	if (IS_ERR(cell))
+		return PTR_ERR(cell);
+
+	val = nvmem_cell_read(cell, &len);
+	nvmem_cell_put(cell);
+	if (IS_ERR(val))
+		return PTR_ERR(val);
+
+	if (len == MXL_MOCA_BASE_MAC_LEN) {
+		memcpy(str, val, len);
+		str[len] = '\0';
+		if (mac_pton(str, mac) && is_valid_ether_addr(mac)) {
+			eth_addr_add(mac, MXL_MOCA_BASE_MAC_OFFSET);
+			ret = 0;
+		}
+	}
+	kfree(val);
+	return ret;
+}
+
 /*
  * Derive the MoCA GUID (as the SoC eMacAddrHi/eMacAddrLo word pair) from, in
- * order: the device tree, the attached netdev MAC, or a random MaxLinear-OUI
- * address.  These two words are patched into the InitParamV2 config payload.
+ * order: the device tree, the board's base MAC, the attached netdev MAC, or a
+ * random MaxLinear-OUI address.  These two words are patched into the
+ * InitParamV2 config payload.
  */
 static void mxl371x_derive_guid(struct phy_device *phydev, u32 *mac_hi,
 				u32 *mac_lo)
@@ -1156,6 +1192,8 @@ static void mxl371x_derive_guid(struct phy_device *phydev, u32 *mac_hi,
 
 	if (dev->of_node && of_get_mac_address(dev->of_node, mac) == 0) {
 		dev_info(dev, "MoCA GUID from device tree: %pM\n", mac);
+	} else if (dev->of_node && mxl371x_board_mac(dev, mac) == 0) {
+		dev_info(dev, "MoCA GUID from board MAC: %pM\n", mac);
 	} else if (phydev->attached_dev &&
 		   !is_zero_ether_addr(phydev->attached_dev->dev_addr)) {
 		ether_addr_copy(mac, phydev->attached_dev->dev_addr);
