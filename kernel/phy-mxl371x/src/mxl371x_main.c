@@ -65,6 +65,9 @@
 #define MXL371X_TSENS_COEFF_A		1338680
 #define MXL371X_TSENS_COEFF_B		277770
 #define MXL371X_TSENS_RSSI_MAX		524288
+/* Die temperatures outside this (millidegrees) are a bad sample, not a reading */
+#define MXL371X_TEMP_MIN		(-40000)
+#define MXL371X_TEMP_MAX		150000
 
 /* Firmware Status */
 #define MXL371X_FW_STATUS_REG		0x08200100
@@ -602,7 +605,15 @@ static int mxl371x_read_temp_raw(struct phy_device *phydev, u32 *t0, u32 *t1)
 {
 	int ret;
 
-	/* Get T0 reading */
+	/*
+	 * Get T0 reading.  A conversion starts on the start bit's rising
+	 * edge, and the previous reading left it set: clear it first, as for
+	 * T1, or T0 is the last reading's T1 and the difference is garbage.
+	 */
+	ret = mxl371x_write_mem32(phydev, MXL371X_TSENS_CTRL_REG, 0x01130003);
+	if (ret < 0)
+		return ret;
+
 	ret = mxl371x_write_mem32(phydev, MXL371X_RADIO_TSENS_REG1, 0x31000001);
 	if (ret < 0)
 		return ret;
@@ -654,9 +665,6 @@ static int mxl371x_read_temp_raw(struct phy_device *phydev, u32 *t0, u32 *t1)
 static int mxl371x_calc_temp(u32 t0, u32 t1)
 {
 	s64 delta, temp;
-
-	if (t1 < t0)
-		return -EINVAL;
 
 	delta = (s64)(t1 - t0);
 	temp = (delta * MXL371X_TSENS_COEFF_A) / MXL371X_TSENS_RSSI_MAX;
@@ -1045,24 +1053,43 @@ static int mxl371x_hwmon_read(struct device *dev, enum hwmon_sensor_types type,
 			      u32 attr, int channel, long *val)
 {
 	struct phy_device *phydev = dev_get_drvdata(dev);
-	u32 t0, t1;
-	int ret, temp;
+	struct mxl371x_priv *priv = phydev->priv;
+	u32 t0 = 0, t1 = 0;
+	int ret, temp, attempt;
 
 	if (type != hwmon_temp)
 		return -EOPNOTSUPP;
 
 	switch (attr) {
 	case hwmon_temp_input:
-		ret = mxl371x_read_temp_raw(phydev, &t0, &t1);
-		if (ret < 0)
-			return ret;
-
-		temp = mxl371x_calc_temp(t0, t1);
-		if (temp == -EINVAL)
-			return -EINVAL;
-
-		*val = temp;
-		break;
+		/*
+		 * The reading is a sequence of register writes and two samples.
+		 * Two readers interleaving it, or a SoC re-init under it, give a
+		 * wrong difference: hold apply_lock across it, and report no data
+		 * rather than wait out a re-init.
+		 */
+		if (!mutex_trylock(&priv->apply_lock))
+			return -ENODATA;
+		ret = -ENODATA;
+		for (attempt = 0; priv->mbox_ready && attempt < 3; attempt++) {
+			ret = mxl371x_read_temp_raw(phydev, &t0, &t1);
+			if (ret < 0)
+				break;
+			ret = -ENODATA;
+			if (t1 < t0)
+				continue;
+			temp = mxl371x_calc_temp(t0, t1);
+			if (temp < MXL371X_TEMP_MIN || temp > MXL371X_TEMP_MAX)
+				continue;
+			*val = temp;
+			ret = 0;
+			break;
+		}
+		mutex_unlock(&priv->apply_lock);
+		if (ret == -ENODATA)
+			dev_dbg(dev, "no plausible temperature (t0 %u t1 %u)\n",
+				t0, t1);
+		return ret;
 
 	default:
 		return -EOPNOTSUPP;
