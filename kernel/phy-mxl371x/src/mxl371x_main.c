@@ -1071,14 +1071,31 @@ static int mxl371x_hwmon_read(struct device *dev, enum hwmon_sensor_types type,
 	return 0;
 }
 
+static int mxl371x_hwmon_read_string(struct device *dev,
+				     enum hwmon_sensor_types type,
+				     u32 attr, int channel, const char **str)
+{
+	struct phy_device *phydev = dev_get_drvdata(dev);
+
+	if (type != hwmon_temp || attr != hwmon_temp_label)
+		return -EOPNOTSUPP;
+
+	*str = phydev->label;
+	return 0;
+}
+
 static umode_t mxl371x_hwmon_is_visible(const void *data,
 					enum hwmon_sensor_types type,
 					u32 attr, int channel)
 {
+	const struct phy_device *phydev = data;
+
 	if (type != hwmon_temp)
 		return 0;
 
 	switch (attr) {
+	case hwmon_temp_label:
+		return phydev->label ? 0444 : 0;
 	case hwmon_temp_input:
 		return 0444;
 	default:
@@ -1089,10 +1106,11 @@ static umode_t mxl371x_hwmon_is_visible(const void *data,
 static const struct hwmon_ops mxl371x_hwmon_ops = {
 	.is_visible = mxl371x_hwmon_is_visible,
 	.read = mxl371x_hwmon_read,
+	.read_string = mxl371x_hwmon_read_string,
 };
 
 static const struct hwmon_channel_info *mxl371x_hwmon_info[] = {
-	HWMON_CHANNEL_INFO(temp, HWMON_T_INPUT),
+	HWMON_CHANNEL_INFO(temp, HWMON_T_INPUT | HWMON_T_LABEL),
 	NULL
 };
 
