@@ -405,6 +405,9 @@ struct mxl371x_priv {
 	unsigned long rates_stamp;	/* jiffies of the last rate/census read */
 	struct mutex rates_lock;
 	struct delayed_work recover_work;
+	/* firmware upload + boot config, off the probe path (~10 s over MDIO) */
+	struct work_struct fw_work;
+	bool warm_boot;
 	bool security_enabled;
 	const char *fw_name;
 	char soc_version[64];
@@ -3518,30 +3521,28 @@ static int mxl371x_config_sgmii(struct phy_device *phydev)
 	return 0;
 }
 
-static int mxl371x_config_init(struct phy_device *phydev)
+/*
+ * Bring the MoCA SoC up: upload the firmware (about 10 s over MDIO on a cold
+ * boot), push the boot configuration, then set up the SGMII/HSGMII host
+ * interface, which the SoC reset of the upload would otherwise undo. Runs
+ * from a work item so that the PHY probe, and with it the switch and the
+ * whole boot, does not wait for the upload; until it is done the coax link
+ * reads down. apply_lock keeps it apart from a live re-init.
+ */
+static void mxl371x_fw_work(struct work_struct *work)
 {
-	struct mxl371x_priv *priv = phydev->priv;
+	struct mxl371x_priv *priv = container_of(work, struct mxl371x_priv, fw_work);
+	struct phy_device *phydev = priv->phydev;
 	struct device *dev = &phydev->mdio.dev;
 	int ret;
-	bool warm_boot = false;
 
-	/* Get device information */
-	ret = mxl371x_get_device_info(phydev);
-	if (ret < 0)
-		return ret;
-
-	/* Check if this is a warm boot */
-	warm_boot = mxl371x_check_firmware_running(phydev);
-	if (warm_boot) {
-		priv->fw_loaded = true;
-		dev_info(dev, "Warm boot detected, skipping firmware load\n");
-	}
+	mutex_lock(&priv->apply_lock);
 
 	/*
 	 * Load firmware (skipped if already running).  A failure here is not
 	 * fatal: the SGMII/HSGMII backhaul link can still come up without the
-	 * MoCA management firmware, so log honestly and continue rather than
-	 * failing the PHY probe.  priv->fw_loaded reflects the real state.
+	 * MoCA management firmware, so log honestly and continue.
+	 * priv->fw_loaded reflects the real state.
 	 */
 	ret = mxl371x_load_firmware(phydev, false);
 	if (ret < 0)
@@ -3551,8 +3552,7 @@ static int mxl371x_config_init(struct phy_device *phydev)
 	/*
 	 * Push the boot configuration (band plan, power maps, GUID) and admit
 	 * the node to the MoCA network over the mailbox.  Without this the
-	 * firmware boots unconfigured and the coax link stays down.  A failure
-	 * is not fatal to the PHY probe -- the SGMII backhaul still comes up.
+	 * firmware boots unconfigured and the coax link stays down.
 	 */
 	if (priv->fw_loaded && priv->mbox_ready) {
 		if (mxl371x_send_config(phydev) < 0)
@@ -3564,9 +3564,35 @@ static int mxl371x_config_init(struct phy_device *phydev)
 	/* Configure SGMII/HSGMII interface
 	 * Uses device tree phy-mode if set, otherwise detects from hardware */
 	ret = mxl371x_config_sgmii(phydev);
-	if (ret < 0) {
+	if (ret < 0)
 		dev_err(dev, "SGMII configuration failed: %d\n", ret);
+
+	/* Start statistics polling */
+	schedule_delayed_work(&priv->stats_poll, HZ);
+
+	dev_info(dev, "MoCA PHY initialized (%s boot, MoCA v%u.%u, %uMbps)\n",
+		 priv->warm_boot ? "warm" : "cold",
+		 priv->moca_version >> 4, priv->moca_version & 0xf, phydev->speed);
+
+	mutex_unlock(&priv->apply_lock);
+}
+
+static int mxl371x_config_init(struct phy_device *phydev)
+{
+	struct mxl371x_priv *priv = phydev->priv;
+	struct device *dev = &phydev->mdio.dev;
+	int ret;
+
+	/* Get device information */
+	ret = mxl371x_get_device_info(phydev);
+	if (ret < 0)
 		return ret;
+
+	/* Check if this is a warm boot */
+	priv->warm_boot = mxl371x_check_firmware_running(phydev);
+	if (priv->warm_boot) {
+		priv->fw_loaded = true;
+		dev_info(dev, "Warm boot detected, skipping firmware load\n");
 	}
 
 	/* Create sysfs attributes */
@@ -3581,18 +3607,8 @@ static int mxl371x_config_init(struct phy_device *phydev)
 	if (ret < 0)
 		dev_warn(dev, "Failed to init hwmon: %d\n", ret);
 
-	/* Start statistics polling */
-	schedule_delayed_work(&priv->stats_poll, HZ);
-
-	if (warm_boot) {
-		dev_info(dev, "MoCA PHY initialized (warm boot, MoCA v%u.%u, %uMbps)\n",
-			 priv->moca_version >> 4, priv->moca_version & 0xf,
-			 phydev->speed);
-	} else {
-		dev_info(dev, "MoCA PHY initialized (cold boot, MoCA v%u.%u, %uMbps)\n",
-			 priv->moca_version >> 4, priv->moca_version & 0xf,
-			 phydev->speed);
-	}
+	/* the firmware upload and the rest of the bring-up go on in the background */
+	schedule_work(&priv->fw_work);
 
 	return 0;
 }
@@ -3613,6 +3629,7 @@ static int mxl371x_probe(struct phy_device *phydev)
 	mutex_init(&priv->cmd_lock);
 	INIT_DELAYED_WORK(&priv->stats_poll, mxl371x_stats_poll_work);
 	INIT_DELAYED_WORK(&priv->recover_work, mxl371x_recover_work);
+	INIT_WORK(&priv->fw_work, mxl371x_fw_work);
 	mutex_init(&priv->rates_lock);
 	return 0;
 }
@@ -3621,6 +3638,7 @@ static void mxl371x_remove(struct phy_device *phydev)
 {
 	struct mxl371x_priv *priv = phydev->priv;
 
+	cancel_work_sync(&priv->fw_work);
 	cancel_delayed_work_sync(&priv->recover_work);
 	cancel_delayed_work_sync(&priv->stats_poll);
 	sysfs_remove_group(&phydev->mdio.dev.kobj, &mxl371x_attr_group);
