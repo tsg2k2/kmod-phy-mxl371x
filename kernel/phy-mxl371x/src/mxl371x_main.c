@@ -2409,6 +2409,98 @@ static ssize_t moca_link_uptime_show(struct device *dev,
 }
 static DEVICE_ATTR_RO(moca_link_uptime);
 
+/*
+ * Link quality to every other node, for monitoring tools (collectd runs as
+ * nobody and cannot use moca_cmd). One line per node, over all MoCA 2.5
+ * channels: PHY rates summed (bit/s), receive and transmit power averaged
+ * (dBm), receive SNR lowest and mean (dB). Profiles are local reads
+ * (0x1010021 RX, 0x1010020 TX: [node, 0x21 | ch << 16, 0]); a node without a
+ * MoCA 2.5 profile prints no values.
+ */
+#define MXL_MOCA_CMD_GET_TX_PROFILE	0x1010020
+#define MXL_MOCA_CMD_GET_RX_PROFILE	0x1010021
+#define MXL_MOCA_CMD_GET_M25_PHY_MISC	0x101007f
+#define MXL_MOCA_PROFILE_M25		0x21
+static ssize_t moca_link_quality_show(struct device *dev,
+		struct device_attribute *attr, char *buf)
+{
+	struct phy_device *phydev = to_phy_device(dev);
+	struct mxl371x_priv *priv = phydev->priv;
+	u32 *rsp, req[3];
+	int n, ch, nch = 1, ret, len = 0;
+
+	if (!priv->mbox_ready)
+		return -ENODEV;
+	if (priv->link_status != MOCA_LINK_UP)
+		return 0;
+
+	rsp = kmalloc_array(MXL_MOCA_CMD_RSP_WORDS, sizeof(*rsp), GFP_KERNEL);
+	if (!rsp)
+		return -ENOMEM;
+
+	ret = mxl371x_mbox_cmd(phydev, MXL_MOCA_CMD_GET_M25_PHY_MISC & 0xffff,
+			       NULL, 0, rsp, MXL_MOCA_CMD_RSP_WORDS,
+			       MXL371X_MBOX_POLL_STATUS);
+	if (ret >= 16)
+		nch = clamp_t(int, rsp[3], 1, 5);
+
+	for (n = 0; n < MXL_MOCA_MAX_NODES; n++) {
+		s64 rx_rate = 0, tx_rate = 0;
+		int rx_pwr = 0, tx_pwr = 0, snr_sum = 0, snr_min = INT_MAX;
+		int nrx = 0, ntx = 0;
+
+		if (!(priv->active_nodes & BIT(n)) || n == priv->node_id)
+			continue;
+
+		for (ch = 0; ch < nch; ch++) {
+			req[0] = n;
+			req[1] = MXL_MOCA_PROFILE_M25 | (ch << 16);
+			req[2] = 0;
+			ret = mxl371x_mbox_cmd(phydev,
+					       MXL_MOCA_CMD_GET_RX_PROFILE & 0xffff,
+					       req, sizeof(req), rsp,
+					       MXL_MOCA_CMD_RSP_WORDS,
+					       MXL371X_MBOX_POLL_STATUS);
+			if (ret >= 83 * 4 && rsp[0]) {
+				int snr = (s32)rsp[82];
+
+				rx_rate += rsp[15];
+				rx_pwr += (s32)rsp[16];
+				snr_sum += snr;
+				snr_min = min(snr_min, snr);
+				nrx++;
+			}
+			ret = mxl371x_mbox_cmd(phydev,
+					       MXL_MOCA_CMD_GET_TX_PROFILE & 0xffff,
+					       req, sizeof(req), rsp,
+					       MXL_MOCA_CMD_RSP_WORDS,
+					       MXL371X_MBOX_POLL_STATUS);
+			if (ret >= 13 * 4 && rsp[0]) {
+				tx_rate += rsp[12];
+				tx_pwr += 5 - (int)min_t(u32, rsp[10], 30);
+				ntx++;
+			}
+		}
+
+		len += sysfs_emit_at(buf, len, "node%d", n);
+		if (priv->node_guid_valid[n])
+			len += sysfs_emit_at(buf, len, " guid=%pM", priv->node_guid[n]);
+		if (nrx)
+			len += sysfs_emit_at(buf, len,
+				" rx_rate=%lld rx_power=%d snr_min=%d snr_avg=%d",
+				rx_rate, DIV_ROUND_CLOSEST(rx_pwr, nrx), snr_min,
+				DIV_ROUND_CLOSEST(snr_sum, nrx));
+		if (ntx)
+			len += sysfs_emit_at(buf, len, " tx_rate=%lld tx_power=%d",
+				tx_rate, DIV_ROUND_CLOSEST(tx_pwr, ntx));
+		len += sysfs_emit_at(buf, len, "\n");
+	}
+
+	kfree(rsp);
+	return len;
+}
+static DEVICE_ATTR_RO(moca_link_quality);
+
 /* Times the coax link went down since the driver loaded. */
 static ssize_t moca_link_lost_show(struct device *dev,
 		struct device_attribute *attr, char *buf)
@@ -2564,6 +2656,7 @@ static struct attribute *mxl371x_attrs[] = {
 	&dev_attr_moca_link_resets.attr,
 	&dev_attr_moca_link_uptime.attr,
 	&dev_attr_moca_link_lost.attr,
+	&dev_attr_moca_link_quality.attr,
 	&dev_attr_moca_mps_trigger.attr,
 	&dev_attr_moca_mps_state.attr,
 	&dev_attr_moca_mps_report.attr,
