@@ -22,6 +22,7 @@
 #include <linux/elf.h>
 #include <linux/slab.h>
 #include <linux/mutex.h>
+#include <linux/timekeeping.h>
 #include <linux/minmax.h>
 #include <linux/unaligned.h>
 
@@ -397,6 +398,9 @@ struct mxl371x_priv {
 	int mbox_fail_count;
 	u32 adm_status;
 	u32 link_resets;
+	/* Coax link bookkeeping the firmware does not keep (boottime seconds). */
+	time64_t link_up_at;
+	u32 link_lost;
 	u32 req_status;
 	unsigned long rates_stamp;	/* jiffies of the last rate/census read */
 	struct mutex rates_lock;
@@ -885,6 +889,10 @@ static int mxl371x_read_moca_status(struct phy_device *phydev)
 
 	priv->link_status = (rsp[MXL_MOCA_LI_OFF_LINKSTATUS / 4] == 1) ?
 			    MOCA_LINK_UP : MOCA_LINK_DOWN;
+	if (priv->link_status == MOCA_LINK_UP && !was_up)
+		priv->link_up_at = ktime_get_boottime_seconds();
+	else if (priv->link_status != MOCA_LINK_UP && was_up)
+		priv->link_lost++;
 	priv->adm_status   = rsp[MXL_MOCA_LI_OFF_ADM / 4];
 	priv->link_resets  = rsp[MXL_MOCA_LI_OFF_RESETCNT / 4];
 	priv->node_id      = rsp[MXL_MOCA_LI_OFF_NODE_ID / 4];
@@ -2387,6 +2395,30 @@ static ssize_t moca_link_resets_show(struct device *dev,
 }
 static DEVICE_ATTR_RO(moca_link_resets);
 
+/* Seconds the coax link has been up, 0 while it is down. */
+static ssize_t moca_link_uptime_show(struct device *dev,
+		struct device_attribute *attr, char *buf)
+{
+	struct mxl371x_priv *priv = to_phy_device(dev)->priv;
+	time64_t up = 0;
+
+	if (priv->link_status == MOCA_LINK_UP)
+		up = ktime_get_boottime_seconds() - priv->link_up_at;
+
+	return sysfs_emit(buf, "%lld\n", (long long)up);
+}
+static DEVICE_ATTR_RO(moca_link_uptime);
+
+/* Times the coax link went down since the driver loaded. */
+static ssize_t moca_link_lost_show(struct device *dev,
+		struct device_attribute *attr, char *buf)
+{
+	struct mxl371x_priv *priv = to_phy_device(dev)->priv;
+
+	return sysfs_emit(buf, "%u\n", priv->link_lost);
+}
+static DEVICE_ATTR_RO(moca_link_lost);
+
 /*
  * MoCA Protected Setup, the coax push button.  A trigger starts a session that
  * pairs with whichever node was triggered within the walk time; the report then
@@ -2530,6 +2562,8 @@ static struct attribute *mxl371x_attrs[] = {
 	&dev_attr_moca_frame_drops.attr,
 	&dev_attr_moca_admission_status.attr,
 	&dev_attr_moca_link_resets.attr,
+	&dev_attr_moca_link_uptime.attr,
+	&dev_attr_moca_link_lost.attr,
 	&dev_attr_moca_mps_trigger.attr,
 	&dev_attr_moca_mps_state.attr,
 	&dev_attr_moca_mps_report.attr,
@@ -3211,6 +3245,12 @@ static int mxl371x_reinit(struct phy_device *phydev)
 
 	/* Quiesce the status poll so it does not race the re-init mailbox use. */
 	cancel_delayed_work_sync(&priv->stats_poll);
+
+	/* Reloading the firmware drops the coax link. */
+	if (priv->link_status == MOCA_LINK_UP) {
+		priv->link_status = MOCA_LINK_DOWN;
+		priv->link_lost++;
+	}
 
 	/* The boot path can occasionally fail to start the CPU; retry once so a
 	 * transient glitch does not leave MoCA torn down. */
